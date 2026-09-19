@@ -17,3 +17,6 @@ results/
 
 .env
 *.log
+
+ENV_SETUP_NOTE.md
+PLAN.md
