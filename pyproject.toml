@@ -1,0 +1,16 @@
+[project]
+name = "multi-agent-baseline"
+version = "0.1.0"
+description = "Direct vs CoT vs Self-Consistency on MATH-500"
+requires-python = "==3.10.*"
+dependencies = [
+    "vllm==0.19.1",
+    "torch==2.10.0",
+    "transformers==5.14.1",
+    "datasets==5.0.1",
+    "pytest>=7.4.4",
+    "psutil>=7.2.2",
+]
+
+[tool.uv]
+package = false

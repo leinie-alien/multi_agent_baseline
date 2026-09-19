@@ -1,0 +1,6 @@
+vllm>=0.19.1
+torch>=2.5.1
+transformers>=5.14.1
+datasets
+pytest
+psutil>=7.2.2

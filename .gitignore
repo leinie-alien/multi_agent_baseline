@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual environment
+.venv/
+
+# 实验输出(体积大、可重新生成,不进版本库)
+results/
+
+# 编辑器/IDE
+.claude/
+
+# OS
+.DS_Store
+
+.env
+*.log
