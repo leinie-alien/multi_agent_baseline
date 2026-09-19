@@ -587,6 +587,153 @@ class ModelRunner:
 
 ---
 
+## 2026-09-19:加 `enable_thinking` CLI 开关 + 把 `max_model_len`/`max_tokens` 从 8192/4096 调大
+
+### 背景
+
+两个独立但顺带一起做的改动:
+
+1. CoT / Self-Consistency 一直靠 `enable_thinking=None`(不传参数,由模型自己决定要不要思考)跑,想加个 CLI 开关能显式控制,方便对比"强制开思考" vs "强制关思考"的效果。
+2. 复盘实验失败样本时,发现有一部分失败原因是 `max_tokens=4096` 把思考过程截断了(`finish_reason == "length"`),而不是模型真的答错——这类"因为长度限制判错"混在"真答错"里,会污染 accuracy 统计,想把长度限制放宽到基本不会成为瓶颈。
+
+### 改动 1:`enable_thinking` 透传到 CLI
+
+`run_single_method`(`src/methods/base.py`)本来就支持 `enable_thinking` 参数,但只有 `run_direct` 在用(固定传 `False`),`run_cot`/`run_self_consistency`/`scripts/run_experiment.py` 都没把这个参数暴露出来。加了:
+
+- `run_cot`、`run_self_consistency` 新增 `enable_thinking: bool | None = None` 形参,直接转发给 `run_single_method`。
+- `run_direct` 也接收这个形参(保持三个方法调用签名一致,方便 `run_experiment.py` 统一传参),但内部 `del enable_thinking` 忽略掉,始终强制 `enable_thinking=False`——direct 方法的定义就是不思考,不应该被 CLI 开关意外打开。
+- `run_experiment.py` 加 `--enable-thinking`/`--disable-thinking` 互斥参数(`argparse` 的 `mutually_exclusive_group`),默认都不传时 `enable_thinking=None`,保持原来"模型自己决定"的行为。
+
+**没踩坑,但值得记录的设计选择**:`run_direct` 接收但忽略参数,而不是从签名里干脆去掉——如果去掉,`run_experiment.py` 里 `run_fn(...)` 那处调用就得对 `direct` 特殊处理(if method == "direct": 不传 enable_thinking),三个方法的调用方式不统一,增加调用方的分支复杂度。用"统一签名,内部按需忽略"换掉"调用方按方法分支",复杂度从调用方转移到实现方,更符合"三个方法应该有一致接口"这个既有设计(`METHOD_RUNNERS` 就是当同类接口用的)。
+
+### 改动 2:`max_model_len` 8192→16384,`max_tokens` 4096→13000
+
+先查了这俩数字当年是怎么定的:8192 不是模型能力上限,是 09-17 笔记记录的那次启动阶段 OOM 调参时(配合 `max_num_seqs=32`、`gpu_memory_utilization=0.85`)试出来的"能跑起来"的值,从没查过模型实际支持多长。这次去读了模型目录下的 `config.json`:
+
+```
+"max_position_embeddings": 262144
+```
+
+Qwen3.5-9B 实际支持 262144,8192 只是当时保守设的显存预算,离模型上限差了 32 倍。另外顺手确认了这个模型的架构对长上下文比较友好:`layer_types` 里 32 层只有每第 4 层是 `full_attention`(KV Cache 随长度线性增长),其余都是 `linear_attention`(状态大小基本不随长度增长)——同样调大 `max_model_len`,这个模型的显存增量比标准全 attention 模型小。
+
+但"友好"不等于"零代价":09-17 笔记分析过,启动阶段的 KV Cache 探测范围、CUDA Graph 编译范围(`Compiling a graph for compile range (1, N)`)都是按 `max_model_len` 算的,调大了这两处开销也会跟着变大,有可能在启动阶段重新撞上那次的 OOM。所以没有直接冲到 262144,选了一个折中的 16384(2 倍),`max_tokens` 跟着调到 13000(留出输入长度的余量),而不是"设成理论最大值"——这是"改配置前先搞懂默认值为什么这么设"(09-18 笔记里第 4 条检查清单)的直接应用。
+
+**这次改动还没验证是否会在启动阶段重新触发显存问题,需要在服务器 GPU 环境跑一次 `run_sanity_check.py` 确认。**
+
+### 一句话总结
+
+**改 CLI 参数时,统一接口比调用方分支更值得优先,即使意味着某个实现要接收一个自己不用的参数。改显存相关的配置数值前,先查这个数值当年是"按模型能力上限设的"还是"按当时的显存预算试出来的"——8192 属于后者,而且从没验证过模型真实上限,这次翻 `config.json` 才发现只用了模型能力的 1/32。放大配置时选比当前值大但离理论上限有安全边际的折中值(16384 而非 262144),把"验证会不会重新 OOM"的风险留在可控范围内,而不是一步冲到底再排查一次完整的 OOM 事故。**
+
+---
+
+## 2026-09-19:q161 判分错误——模型答对了但被判错,两层原因叠在一起
+
+### 现象
+
+sanity check 结果里,`cot`/`run_seed42` 的 q161 被判为错误:`prediction: "1"`,`ground_truth: "14"`。但翻开原始输出 `raw_outputs/q161.txt` 一看,模型明明已经在文本靠前的位置正确推导并写出了 `\boxed{14}`——答案本身没错,是判分环节把它判错了。
+
+### 排查:两层原因,缺一都不会出这个 bug
+
+**第一层(模型侧):正确给出答案后没有停下来,陷入重复循环直到被截断**
+
+q161 的原始输出在写出 `\boxed{14}` 之后,并没有输出结束符(EOS)收尾,而是不断重复输出同样的 `\boxed{14}` 片段,一直循环到 `max_tokens` 上限,最后一次重复恰好在写到 `\boxed{1` 时被硬截断(`finish_reason == "length"`),缺右花括号,是一个不完整、不闭合的片段。
+
+**第二层(提取侧):`last_boxed_only_string` 只看"最后一次出现",不闭合就直接放弃**
+
+`src/extract_answer.py` 里原来的 `last_boxed_only_string` 逻辑是:找文本里最后一个 `\boxed`/`\fbox` 出现的位置,从那里往后数花括号配对,取配对内容。但因为最后一次重复被截断,配对天生就凑不齐,函数直接返回 `None`,完全没有考虑"再往前找上一个完整的 `\boxed{}`"这个选项。`extract_answer` 拿到 `None` 后按预设的兜底逻辑退化成"抓文本里最后出现的裸数字"的正则,而这个正则抓到的刚好是截断片段里孤零零的那个 `1`——于是 `prediction` 变成了 `"1"`。
+
+**两层因果关系**:如果模型没有陷入重复循环(第一层没发生),`\boxed{14}` 就是文本里唯一/最后的完整占用,`last_boxed_only_string` 原逻辑也能对;如果提取逻辑本身支持"跳过不完整的,退回上一个完整的"(第二层不是这么写的),即使模型重复也不影响最终提取结果。两层缺一个,q161 都不会出这个错——是"模型侧的退化行为"暴露了"提取侧本来就存在但一直没被触发"的一个逻辑漏洞。
+
+### 解决 1(已修,提取侧):`last_boxed_only_string` 改成从后往前跳过不完整的occurrence
+
+把原来"只看最后一次出现"改成:维护一个不断收缩的搜索终点 `search_end`,每次从 `search_end` 往前找最近一个 `\boxed`/`\fbox`,尝试配对花括号;配对失败(不闭合)就把 `search_end` 收缩到这次失败位置之前,继续往前找上一个,直到找到一个能配对成功的,或者彻底找不到再返回 `None`。用一条构造出的复现场景验证:
+
+```python
+text = "Thus the answer is \\boxed{14}.\n\n\\boxed{14}\n\n\\boxed{1"
+assert extract_answer(text) == "14"
+```
+
+补充了对应测试 `test_extract_boxed_truncated_repetition_falls_back_to_earlier_complete_one`(`tests/test_extract_answer.py`),连同已有 15 条测试全部通过。
+
+### 解决 2(已加,模型侧):给采样加 `repetition_penalty`,从源头抑制退化重复循环
+
+只修提取侧只能保证"万一模型又重复循环,不会因为截断位置不巧而判错",但没解决模型侧本身白白烧掉一整份 `max_tokens` 预算在无意义重复上的问题(既浪费 token/时间,也不能保证下次重复不会连"上一个完整的 `\boxed{}`"都卷进截断范围)。
+
+vLLM 的 `SamplingParams` 本身就支持 `repetition_penalty`(装的 0.19.1 版本确认有这个字段,默认 1.0 即不惩罚,>1.0 时对已经出现过的 token 降低再被选中的概率),用它从生成阶段就压低"复读同一段内容"的概率,比在提取阶段补救更治本。
+
+改动位置:
+
+```python
+# src/model_runner.py:ModelRunner.generate() 新增形参,原样传给 SamplingParams
+def generate(self, prompts, temperature, max_tokens, n=1, seed=None, repetition_penalty=1.0):
+    sampling_params = SamplingParams(..., repetition_penalty=repetition_penalty)
+
+# src/config.py:MethodSamplingConfig 新增字段,三个方法配置都带上
+@dataclass
+class MethodSamplingConfig:
+    temperature: float
+    n: int = 1
+    repetition_penalty: float = 1.05  # 温和惩罚,不明显影响正常回答质量
+```
+
+`src/methods/base.py` 的 `run_single_method` 以及 `direct.py`/`cot.py`/`self_consistency.py` 三个方法文件都相应加了这一参数的透传,从各自的 `MethodSamplingConfig` 一路带到 `runner.generate(...)`。默认值选了 1.05 这种温和值而不是更激进的数字,是因为惩罚一旦调太高,可能反而干扰正常解题时确实需要重复某些 token(比如公式里的变量名、多步验证时重复引用同一个数)的场景——具体这个值够不够压住 q161 这类退化循环,还没有在真实 GPU/vLLM 环境里重跑验证过,只做了参数传递路径的单测覆盖(`tests/test_model_runner.py` 新增两条,用假的 `LLM`/`SamplingParams` 验证 `repetition_penalty` 确实被传到位,不需要真实 GPU)。
+
+### 一句话总结
+
+**判分错误不一定是模型答错,也可能是"模型侧退化重复 + 截断" 和 "提取逻辑只看最后一次出现、不会回退" 两层问题叠加导致的假阳性——提取侧的 bug 平时隐藏得很深,只有配合特定的截断位置才会暴露。修复分两层:提取侧让 `last_boxed_only_string` 支持跳过不完整的 occurrence 回退到上一个完整的(治标,防止再次判错),模型侧加 `repetition_penalty` 从采样源头压低退化重复的概率(治本,减少这类循环真的发生)。后者的实际效果还需要在真实环境跑一次采样验证。**
+
+---
+
+## 2026-09-19:q161 遗留问题的后续——调大预算 + 截断时禁用兜底提取
+
+### 现象
+
+上一条 q161 笔记修完之后留了一个没验证的疑点:`repetition_penalty` 到底能不能压住退化重复循环,当时没在真实环境跑过。真的跑了之后发现:即使不发生 q161 那种"答案写完了还在重复"的退化循环,Level 5 难题本身在开启思考模式(`enable_thinking`)后,正常的、非重复的推理探索(尝试多种情况、多条分支)也经常长到超过当时 `max_tokens=13000` 的预算,还没写到 `\boxed{}` 就被硬截断了。这跟 q161 是同一个 `finish_reason == "length"` 现象,但原因不同:q161 是"答案已经有了,只是没停下来";这次是"答案确实还没推出来,预算给太小"。
+
+### 排查
+
+两种"被截断"场景需要区分对待:
+
+1. **截断,但之前已经写过完整 `\boxed{}`**(如 q161):上一条笔记已经修好——`last_boxed_only_string` 会跳过不闭合的 occurrence,回退到前面那个完整的。
+2. **截断,且全文都没有任何完整 `\boxed{}`**(这次遇到的新情况):模型确实还没推理完,`extract_answer` 原来的兜底逻辑(找不到 `\boxed{}` 就退化成"抓文本里最后一个裸数字")会硬抓一个数字凑出一个 `prediction`。但这个数字只是截断点附近偶然出现的东西,例如"情况一:乘积是33,所以 a_{n-1} 可能是1"里的"1",它是某个分支探索里的中间数字,不是模型的最终结论。把它当成一次有效预测,等于伪造了一个近似随机的答案。
+
+第二种情况在 Self-Consistency 里危害更大:5 次采样里如果有几次是这种"伪答案",会直接参与多数投票,可能把一个错误的伪造答案投成最终 `prediction`,而不是老老实实告诉你"这道题没采出有效答案"。
+
+### 解决 1:调大 `max_tokens`/`max_model_len`,先从源头减少截断发生的频率
+
+`src/config.py` 里 `max_tokens` 从 13000 调到 20000,`max_model_len` 从 16384 调到 24576(留够输入 prompt + 20000 输出的空间)。这只能缓解,不能保证消除——Level 5 难题的推理长度分布本身有长尾,调多大都可能有极少数题目还是会碰到上限。
+
+**后续验证**:调到 20000 之后重新跑 sanity check,q161 在 `cot`/`self_consistency` 里依然 `finish_reason == "length"`(self_consistency 甚至 5 个样本全部截断)。查看 `raw_outputs/q161.txt` 截断处的文本,里面是模型在老老实实穷举符号组合、验证有理根定理,没有重复段——不是 q161 那种"答案写完了还在复读"的退化循环,是这道 Level 5 题本身需要的推理长度就超过 20000。这次先不给这类题目的推理长度设限,把 `max_tokens` 进一步调到 32000、`max_model_len` 调到 36864。仍然截断的极端长尾case交给下面解决 2 的 `allow_fallback` 兜底,不再继续死磕预算数字。
+
+### 解决 2:`extract_answer` 加 `allow_fallback` 参数,截断且无 `\boxed{}` 时禁用兜底规则
+
+既然调大预算不能保证消除截断,提取逻辑就必须能诚实地承认"没有可靠信号时就说不知道",而不是每次都硬凑一个答案。`extract_answer(model_output, allow_fallback=True)` 的三层提取优先级:
+
+1. `\boxed{}`/`\fbox{}`(最高置信度,模型自己明确写的最终答案)
+2. "final answer is X" / "答案是X" 这类短语正则匹配
+3. 文本里最后一个裸数字/分数(置信度最低)
+
+`allow_fallback=False` 时关掉第 2、3 层,第 1 层找不到就直接返回 `None`,不再退化去抓数字。`src/methods/base.py` 的 `run_single_method` 按采样的 `finish_reason` 决定要不要允许兜底:
+
+```python
+sample_answers = [
+    extract_answer(s.text, allow_fallback=s.finish_reason != "length")
+    for s in out.samples
+]
+```
+
+正常结束(`finish_reason == "stop"`)的采样照常允许兜底;被截断的采样禁用兜底,没写到 `\boxed{}` 就直接是 `None`。
+
+`self_consistency.py` 的 `majority_vote` 不需要改——它已经有 `if not valid: return None, "no_valid_answer"`,`None` 会被自动过滤掉不参与投票。以前 q161 这类"全部截断且无 `\boxed{}`"的场景会投出一个类似 `"33 (1/5) [tie]"` 的误导性结果,现在会诚实地变成 `(None, "no_valid_answer")`。
+
+新增测试覆盖:`tests/test_extract_answer.py` 两条(验证 `allow_fallback=False` 时截断场景返回 `None`、`\boxed{}` 命中不受影响),`tests/test_methods_base.py`(新文件,之前这个模块零覆盖)两条,用一个不依赖真实 vLLM 的假 `ModelRunner`(只需实现 `build_prompt`/`generate` 两个方法)验证 `run_single_method` 按 `finish_reason` 正确决定 `allow_fallback`。
+
+### 一句话总结
+
+**截断(`finish_reason == "length"`)分两种:答案已经有但没停下来(上一条笔记修的),和答案确实还没推出来(这条修的)。前者靠"跳过不完整 occurrence 回退到上一个完整 `\boxed{}`"解决,后者靠"没有 `\boxed{}` 就不要硬凑答案"解决——本质都是同一条原则:提取逻辑对截断样本要更谨慎,宁可诚实地返回 `None`,也不要伪造一个看似合理但其实是随机噪音的预测,尤其是在 Self-Consistency 的多数投票场景下,一个伪造答案可能直接污染最终结果。**
+
+---
+
 # 概念笔记(不依赖具体事故,纯知识点)
 
 > 上面的记录都是"踩坑复盘",每条都挂在一次具体事故上。但项目里还有一类知识——写代码前就该搞懂的基础概念(比如这次的 temperature、seed)——它们不是从事故里挖出来的,硬凑一个"现象/原因/解决"的事故模板反而别扭。所以单开这一部分,专门放这种"纯知识点"笔记,跟上面的事故日志分开存放,方便以后只想复习概念时不用从事故堆里翻。
@@ -658,5 +805,56 @@ DEFAULT_SEEDS: list[int] = [41, 42, 43]
 - **CoT / Self-Consistency:都不传这个参数,保持默认 `None`**。这两种方法的设计目的就是考察"有推理过程"时的效果(CoT 显式要求模型逐步推理并写出来;Self-Consistency 建立在 CoT 的 prompt 之上,多次采样再投票),所以没必要也不应该关掉模型自带的思考能力——让模型自己决定要不要用、用多长,比强行开或强行关都更贴近真实使用场景,也符合"CoT/SC 就是要看推理"这个实验意图。
 
 一句话总结这组设计:**enable_thinking 是"要不要给模型留推理空间"的开关,三种方法里只有 Direct 需要主动关掉它,CoT 和 Self-Consistency 都靠模型自主决定,因为它们本来就是在考察推理这件事本身。**
+
+## 2026-09-19:vLLM 跑起来时的两条进度条,"Rendering prompts" 和 "Processed prompts" 分别在干什么
+
+跑实验时终端会先后出现两条 tqdm 进度条,对应 vLLM 源码 `vllm/entrypoints/llm.py` 里两个不同阶段(装的版本是 0.19.1,行号可能随版本变化):
+
+1. **Rendering prompts**(`_add_completion_requests`):把每条 prompt 字符串分词成 token id,塞进 engine 的请求队列。纯 CPU 操作,逐条处理,耗时基本只跟 prompt 数量、长度成正比,一般很快跑完。
+
+   注意这里容易搞混的一点:项目里 `ModelRunner.build_prompt()`(`src/model_runner.py:100`)已经用 tokenizer 的 `apply_chat_template` 把 messages 渲染成了字符串,这一步做的是 messages → prompt 字符串。vLLM 这条 "Rendering prompts" 进度条是对这个字符串**再做一次分词**(prompt 字符串 → token id),两者不是同一步,只是名字里都有"render"容易联想到一起。
+
+2. **Processed prompts**(`_run_engine`):真正的生成主循环,`while llm_engine.has_unfinished_requests(): engine.step()`,每一步做一次 prefill/decode,在 GPU 上跑。这条进度条的总耗时 ≈ 这一批所有请求的(输入 token + 输出 token)之和,几乎就是整次推理调用的耗时主体。
+
+**为什么"有时候很长"**:基本都是 Processed prompts 这一条在拖时间,不是 Rendering。Self-Consistency 每题要采样 `n=5` 份,总生成量约是 CoT 的 5 倍(实测 avg_output_tokens 一个 8000+ 一个 40000+,比例接近 5),所以同样题量下 Self-Consistency 跑得明显更久;另外 Level 5 难题开思考模式后单条生成本身就长,`max_tokens` 调得越大,理论上单条生成能跑的时间也越长,Processed prompts 这条进度条走得就越慢。
+
+### 为什么两条都叫 "...prompts"
+
+两条进度条数的是同一批"请求"(对应你传进去的每一条 prompt),只是站在不同阶段数:Rendering 数的是"这条 prompt 有没有被分好词、注册成请求";Processed 数的是"这条请求有没有跑完生成"。同一个单位(prompt/请求),前一个阶段处理它的输入,后一个阶段等它的输出完成。
+
+### `output_tokens == max_tokens` 的实锤:q161
+
+`cot/run_seed42/per_question.jsonl` 里 q161 这条:`"prediction": null, "output_tokens": 20000`——当时 `max_tokens` 恰好设的是 20000。这条生成不是模型自己说完话停下来的(那样 `finish_reason` 会是 `"stop"`,数字不会刚好等于上限),是被 `while engine.has_unfinished_requests(): engine.step()` 这个循环硬控制在第 20000 步标记"完成"的(`finish_reason == "length"`)。这一条直接证明:一条请求什么时候能被 Processed prompts 这条进度条计入"完成",是受 `max_tokens` 直接约束的——模型自己停,或者撞上限,谁先到就按谁算完成。
+
+### 每一步 `engine.step()` 到底在干什么:模型给概率分布,采样器/`seed` 决定选哪个词
+
+`step()` 每喊一次,只往每条未完成的请求后面添一个 token,不是一次吐出一整段话。具体到这一步内部:
+
+1. **模型只负责算一件事**:给定当前已经生成的所有内容,下一个位置每个候选词各有多大概率——模型的输出本质是一张"候选词 → 概率"的表,不是直接给出"就是这个词"的结论。
+2. **真正"选哪个词"是采样器(sampler)的工作**,不是模型本身决定的。采样器按 `temperature`(把这张概率表变得更平滑/更尖锐)和 `seed`(决定"抽签"用的那条确定性数字序列,详见上面 seed 那节 [[project-seed-note]])算出一个具体的词,追加到序列末尾。
+3. 这个新词被喂回模型,模型基于"原内容 + 新词"重新算下一步的概率表,`step()` 再喊一次——如此循环,直到某条请求生成了停止符(`finish_reason: "stop"`)或撞到 `max_tokens`(`finish_reason: "length"`),这条请求才算完成,从 Processed prompts 的"未完成集合"里退出。
+
+所以完整链路是:**模型每一步只产出概率分布 → 采样器(受 temperature/seed 控制)从分布里选出具体的词 → 循环喂回、逐词累积 → 直到停止符或 `max_tokens` 兜底,请求才算"处理完"**。Processed prompts 这条进度条,数的就是这个循环里"退出未完成集合"的请求数量。
+
+### 没开思考模式、单条 output_tokens 也不算多,为什么 Processed prompts 还是走了很久
+
+这是两件事叠在一起,跟"有没有思考模式"本身没关系:
+
+1. **decode 天生是逐 token 串行的,跟有没有 `<think>` 标签无关**。不开思考模式,模型正常写解题过程(展开算式、分情况讨论)照样要写几千字,每个 token 都要过一次完整的模型前向计算——吐 3000 个 token 就要老老实实跑 3000 步 `engine.step()`,这个耗时只取决于"要写多少字",不取决于"是不是思考模式产生的"。
+
+2. **`engine.step()` 是让这一批所有未完成的请求一起往前挪一步,不是谁写完谁先退出**。Self-Consistency 的 `n=5` 意味着一道题就有 5 条序列同时在跑,sanity check 一批 5 道题就是最多 25 条序列同时占着显存、同时被这个循环喂 token。只要这 25 条里还有一条没写完(比如卡到近 5000 token 才停),整个 batch 就要陪着它一步步跑到底——Processed prompts 不会因为其他几条已经写完就提前挪动,它卡的是"这一批里最慢的那条"。
+
+所以感觉"token 不多但等了很久",往往是:单条看起来不夸张,但一批里有几条偏长的拖了后腿,而且是多条序列一起占着 GPU 做前向计算,不是纯粹被某一条的 token 总数决定的。
+
+### 把 max_tokens 调到 32000 后,truncation 并没有清零:q161 换了个方式继续截断
+
+一开始以为把 `max_tokens` 从 20000 调到 32000 就解决了截断问题,但 `20260919_184838_` 这一轮 `direct`(truncation_rate 0.2)和 `self_consistency`(truncation_rate 0.12)里都还有截断,只有 `cot` 这一轮碰巧是 0。查下来两边的截断都来自同一道题:**q161(level 5)**。
+
+- `direct/run_seed42/per_question.jsonl` 里 q161:`output_tokens: 32000`,`finish_reason: ["length"]`——精确等于当前的 `max_tokens` 上限,和当年 20000 那次一模一样的信号:不是模型自己停的,是被硬截断的。
+- `self_consistency/run_seed42/per_question.jsonl` 里 q161 的 5 个采样,`finish_reasons` 是 `["length","stop","length","length","stop"]`,`samples`(每条的抓取结果)是 `[null, "14", null, null, "14"]`——5 条里 3 条截断、2 条正常收敛到 `\boxed{14}`,靠 vote 兜住了正确答案。
+
+关键是这次去翻了被截断的 3 条原文,**不是** 之前那种"答案写完了还在死循环"的退化:每条 1500 多行文本里,重复 3 次以上的行只有十几条、最多重复十次左右,绝大多数行都是新内容,是模型在穷举各种根的组合($x=-33,-11,3,...$ 各种取值分情况讨论)。也就是 `config.py` 注释里说的那种情况——**真实的分支探索,不是重复循环**,只是这道题分支确实多,32000 个 token 写到一半还没探索完就被截断,根本没来得及写 `\boxed{}`。
+
+所以结论是:`repetition_penalty=1.05` 是在压"同一句话反复讲"这种退化循环,对 q161 这种"分支本身就多、写不完"的情况没用武之地——不管 `max_tokens` 调多大,这道题都有可能刚好不够用。这类 case 目前的处理方式是让它保持 `truncation_rate` 不为 0,靠 `extract_answer.py` 的 `allow_fallback`(按 `finish_reason == "length"` 关掉兜底)诚实返回 `None`,而不是从截断处硬凑一个假答案;`self_consistency` 还能靠多个样本投票把这类偶发截断吃掉。真要把 q161 的 truncation_rate 压到 0,得从"限制分支探索的写法"或者"接受这道题在 direct/cot 下就是会失败"这个方向想,单纯加大 `max_tokens` 治不了。
 
 ---

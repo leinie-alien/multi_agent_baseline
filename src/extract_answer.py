@@ -10,29 +10,38 @@ import re
 
 
 def last_boxed_only_string(text: str) -> str | None:
-    """提取文本中最后一个 \\boxed{...} 或 \\fbox{...} 整体子串(含花括号配对)。"""
-    idx = text.rfind("\\boxed")
-    if idx < 0:
-        idx = text.rfind("\\fbox")
+    """提取文本中最后一个花括号配对完整的 \\boxed{...} 或 \\fbox{...} 整体子串。
+
+    从后往前找 \\boxed/\\fbox 出现位置;若最靠后的一个因文本被截断而花括号未配对完整
+    (例如生成在 max_tokens 处截断,恰好断在某次重复的 \\boxed{...} 中间),则跳过它,
+    继续往前找上一个配对完整的,而不是直接判定整段提取失败。
+    """
+    search_end = len(text)
+    while True:
+        idx = text.rfind("\\boxed", 0, search_end)
+        fbox_idx = text.rfind("\\fbox", 0, search_end)
+        idx = max(idx, fbox_idx)
         if idx < 0:
             return None
 
-    i = idx
-    right_brace_idx = None
-    num_left_braces_open = 0
-    while i < len(text):
-        if text[i] == "{":
-            num_left_braces_open += 1
-        if text[i] == "}":
-            num_left_braces_open -= 1
-            if num_left_braces_open == 0:
-                right_brace_idx = i
-                break
-        i += 1
+        i = idx
+        right_brace_idx = None
+        num_left_braces_open = 0
+        while i < len(text):
+            if text[i] == "{":
+                num_left_braces_open += 1
+            if text[i] == "}":
+                num_left_braces_open -= 1
+                if num_left_braces_open == 0:
+                    right_brace_idx = i
+                    break
+            i += 1
 
-    if right_brace_idx is None:
-        return None
-    return text[idx:right_brace_idx + 1]
+        if right_brace_idx is not None:
+            return text[idx:right_brace_idx + 1]
+
+        # 括号未配对完整(通常是截断导致),从这个出现位置之前继续找上一个
+        search_end = idx
 
 
 def remove_boxed(boxed_str: str) -> str:
@@ -56,10 +65,15 @@ _FINAL_ANSWER_PATTERNS = [
 _LAST_NUMBER_PATTERN = re.compile(r"-?\d+(?:\.\d+)?(?:/\d+)?")
 
 
-def extract_answer(model_output: str) -> str | None:
+def extract_answer(model_output: str, allow_fallback: bool = True) -> str | None:
     """从模型输出中提取最终答案字符串。
 
     优先级: \\boxed{} > "final answer is / answer:" 等模式(取最后一行匹配) > 文本中最后一个数字/分数。
+
+    allow_fallback=False 时只认 \\boxed{}/\\fbox{},不使用后两级兜底规则。用于输出被
+    max_tokens 截断且找不到 \\boxed 的情况:此时文本是在任意位置硬断开的,兜底规则抓到的
+    "最后一个数字"只是断点附近偶然出现的数字,不是模型的真实结论,当成答案会把截断噪音
+    伪装成一次预测(误判对/误判错都可能发生),详见 LEARNING_NOTES.md q161 相关记录。
     """
     if not model_output:
         return None
@@ -67,6 +81,9 @@ def extract_answer(model_output: str) -> str | None:
     boxed = last_boxed_only_string(model_output)
     if boxed is not None:
         return remove_boxed(boxed).strip()
+
+    if not allow_fallback:
+        return None
 
     for line in reversed(model_output.strip().splitlines()):
         line = line.strip()

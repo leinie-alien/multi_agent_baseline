@@ -7,8 +7,12 @@ class ModelConfig:
     model_path: str = "/data/lsl/cache/huggingface/models/Qwen3.5-9B"
     tensor_parallel_size: int = 2
     gpu_memory_utilization: float = 0.85
-    max_model_len: int = 8192
-    max_tokens: int = 4096  # 三种方法统一的最大输出长度上限(2048 时怀疑推理被截断,调大到 4096)
+    max_model_len: int = 36864  # 模型 max_position_embeddings=262144,这里只按显存预算保守设,非模型上限
+    max_tokens: int = 32000  # 三种方法统一的最大输出长度上限。开思考模式后 Level 5 难题的真实推理
+    # (非重复,是正常的分支探索)经常超过之前 13000/20000 的预算,导致输出被硬截断、没写到 \boxed{}
+    # 就没了(详见 LEARNING_NOTES.md q161 相关记录)。当前先不对这类题目的推理长度设限,尽量把预算
+    # 调大;仍然截断的极端长尾case由 extract_answer.py 的 allow_fallback 兜底,诚实返回 None 而不是
+    # 伪造答案。
     # vLLM 默认按 256 路并发热身(sampler warmup + CUDA graph 最小 KV cache
     # 预留),但本实验一次最多 200 题 * Self-Consistency n=5,远用不到 256。
     # 调低能同步降低这两处启动阶段的显存占用,避免顶穿 gpu_memory_utilization
@@ -18,9 +22,15 @@ class ModelConfig:
 
 @dataclass
 class MethodSamplingConfig:
-    """每种方法的采样参数。三个方法必须共用同一个 ModelConfig,只有这里的采样参数不同。"""
+    """每种方法的采样参数。三个方法必须共用同一个 ModelConfig,只有这里的采样参数不同。
+
+    repetition_penalty 默认 1.05(vLLM 默认是 1.0,即不惩罚):sanity check 中发现过
+    模型正确给出 \\boxed{} 答案后陷入重复循环直到 max_tokens 截断的情况(q161),给
+    一个温和的重复惩罚可以在不明显影响正常回答质量的前提下抑制这种退化循环。
+    """
     temperature: float
     n: int = 1
+    repetition_penalty: float = 1.05
 
 
 DIRECT_SAMPLING = MethodSamplingConfig(temperature=0.6, n=1)

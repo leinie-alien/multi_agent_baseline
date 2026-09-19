@@ -114,6 +114,7 @@ class ModelRunner:
         max_tokens: int,
         n: int = 1,
         seed: int | None = None,
+        repetition_penalty: float = 1.0,
     ) -> list[PromptResult]:
         from vllm import SamplingParams
 
@@ -122,6 +123,7 @@ class ModelRunner:
             max_tokens=max_tokens,
             n=n,
             seed=seed,
+            repetition_penalty=repetition_penalty,
         )
         outputs = self.llm.generate(prompts, sampling_params)
 

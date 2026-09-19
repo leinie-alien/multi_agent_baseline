@@ -35,7 +35,14 @@ def majority_vote(answers: list[str | None]) -> tuple[str | None, str]:
     return winner, vote_desc
 
 
-def run_self_consistency(runner: ModelRunner, questions: list[dict], *, max_tokens: int, seed: int) -> RunResult:
+def run_self_consistency(
+    runner: ModelRunner,
+    questions: list[dict],
+    *,
+    max_tokens: int,
+    seed: int,
+    enable_thinking: bool | None = None,
+) -> RunResult:
     return run_single_method(
         runner,
         questions,
@@ -46,4 +53,6 @@ def run_self_consistency(runner: ModelRunner, questions: list[dict], *, max_toke
         seed=seed,
         method_name="self_consistency",
         vote_fn=majority_vote,
+        enable_thinking=enable_thinking,
+        repetition_penalty=SELF_CONSISTENCY_SAMPLING.repetition_penalty,
     )

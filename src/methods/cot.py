@@ -4,7 +4,14 @@ from ..prompts import build_cot_messages
 from .base import RunResult, run_single_method
 
 
-def run_cot(runner: ModelRunner, questions: list[dict], *, max_tokens: int, seed: int) -> RunResult:
+def run_cot(
+    runner: ModelRunner,
+    questions: list[dict],
+    *,
+    max_tokens: int,
+    seed: int,
+    enable_thinking: bool | None = None,
+) -> RunResult:
     return run_single_method(
         runner,
         questions,
@@ -14,4 +21,6 @@ def run_cot(runner: ModelRunner, questions: list[dict], *, max_tokens: int, seed
         n=COT_SAMPLING.n,
         seed=seed,
         method_name="cot",
+        enable_thinking=enable_thinking,
+        repetition_penalty=COT_SAMPLING.repetition_penalty,
     )

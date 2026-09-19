@@ -36,6 +36,26 @@ def test_extract_no_answer():
     assert extract_answer("blah blah no numbers or boxed here") is None
 
 
+def test_extract_allow_fallback_false_without_boxed_returns_none():
+    # 复现截断且未写到 \boxed 的场景:兜底规则本可以从文本里抓到一个数字,
+    # 但那只是截断点附近偶然出现的数字,不是模型的真实结论,应返回 None 而非伪造答案。
+    text = "Case 1: product is 33, so a_{n-1} could be 1"
+    assert extract_answer(text, allow_fallback=True) == "1"
+    assert extract_answer(text, allow_fallback=False) is None
+
+
+def test_extract_allow_fallback_false_still_returns_boxed():
+    text = "Thus the final answer is \\boxed{14}."
+    assert extract_answer(text, allow_fallback=False) == "14"
+
+
+def test_extract_boxed_truncated_repetition_falls_back_to_earlier_complete_one():
+    # 复现 q161 场景:模型正确给出 \boxed{14} 后陷入重复循环,
+    # 最终在 max_tokens 处截断,恰好断在某次重复的 \boxed{ 中间(缺右花括号)。
+    text = "Thus the answer is \\boxed{14}.\n\n\\boxed{14}\n\n\\boxed{1"
+    assert extract_answer(text) == "14"
+
+
 def test_is_equiv_exact_match():
     assert is_equiv("42", "42")
 

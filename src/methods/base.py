@@ -75,6 +75,7 @@ def run_single_method(
     method_name: str,
     vote_fn: VoteFn | None = None,
     enable_thinking: bool | None = None,
+    repetition_penalty: float = 1.0,
 ) -> RunResult:
     """跑一批题目并返回结果。n=1 时直接取唯一采样的答案;n>1 时必须提供 vote_fn 做投票。
 
@@ -88,11 +89,24 @@ def run_single_method(
         runner.build_prompt(message_builder(q["problem"]), enable_thinking=enable_thinking)
         for q in questions
     ]
-    outputs = runner.generate(prompts, temperature=temperature, max_tokens=max_tokens, n=n, seed=seed)
+    outputs = runner.generate(
+        prompts,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        n=n,
+        seed=seed,
+        repetition_penalty=repetition_penalty,
+    )
 
     records: list[QuestionRecord] = []
     for q, out in zip(questions, outputs):
-        sample_answers = [extract_answer(s.text) for s in out.samples]
+        # 被截断(finish_reason == "length")的采样禁用兜底提取规则:截断点是硬断开的,
+        # 兜底规则抓到的"最后一个数字"只是断点附近偶然出现的数字,不是模型的真实结论,
+        # 当成一次有效预测会把截断噪音伪装成答案(见 extract_answer 的 allow_fallback 说明)。
+        sample_answers = [
+            extract_answer(s.text, allow_fallback=s.finish_reason != "length")
+            for s in out.samples
+        ]
         output_tokens = sum(s.output_tokens for s in out.samples)
         # Token 统计口径:多次采样共用同一份输入,但按“公平对比等价于 N 次独立调用”的口径,
         # 输入 token 按 input_tokens * n 计入。
