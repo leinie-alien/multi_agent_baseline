@@ -37,6 +37,40 @@ DIRECT_SAMPLING = MethodSamplingConfig(temperature=0.6, n=1)
 COT_SAMPLING = MethodSamplingConfig(temperature=0.6, n=1)
 SELF_CONSISTENCY_SAMPLING = MethodSamplingConfig(temperature=0.7, n=5)
 
+
+@dataclass
+class DebateConfig:
+    """Debate(Proposer-Critic-Refine)的角色数量/轮次/采样参数,是考核要求里
+    "记录用了几个 agent、最多几轮、聚合/终止方式"的唯一代码来源。
+
+    固定四阶段流程:solve -> [不一致才做] critic -> refine -> [仍不一致才做] judge。
+    max_rounds=4 是这四个阶段的安全上限,真正是否进入某一阶段由 orchestrator 里的
+    收敛判断决定(一致就早停跳过后续阶段),不是每题都跑满四阶段。
+    """
+    num_solvers: int = 3
+    max_rounds: int = 4
+    solver_temperature: float = 0.7
+    critic_temperature: float = 0.6
+    refine_temperature: float = 0.6
+    judge_temperature: float = 0.3
+    repetition_penalty: float = 1.05
+
+
+@dataclass
+class PEVConfig:
+    """Planner-Executor-Verifier 的候选策略数/反馈轮次上限/采样参数。
+
+    executor_temperature、verifier_temperature 默认给得比 planner 低:执行阶段是
+    照既定策略机械算下去,验证阶段是机械复核不是发散点评,两者都不需要太多随机性;
+    多样性主要靠 num_strategies(多个候选策略)而非采样温度提供。
+    """
+    num_strategies: int = 2
+    max_feedback_rounds: int = 2  # Verifier 判 FAIL 后,Planner 最多被打回重新出策略的次数(不含首次)
+    planner_temperature: float = 0.7
+    executor_temperature: float = 0.3
+    verifier_temperature: float = 0.3
+    repetition_penalty: float = 1.05
+
 # 每种方法重复运行的次数与对应 seed(seed 与重复次数一一对应,不同 repeat 用不同 seed
 # 以产生真实的采样波动,同时保证结果可复现)。
 DEFAULT_SEEDS: list[int] = [41, 42, 43]

@@ -8,6 +8,7 @@ __pycache__/
 
 # 实验输出(体积大、可重新生成,不进版本库)
 results/
+results_no_thinking/
 
 # 编辑器/IDE
 .claude/
@@ -20,3 +21,5 @@ results/
 
 ENV_SETUP_NOTE.md
 PLAN.md
+EXPERIMENT_COMMANDS.md
+PROJECT_STATUS.md

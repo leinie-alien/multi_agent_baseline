@@ -29,13 +29,23 @@ from src.methods.cot import run_cot  # noqa: E402
 from src.methods.direct import run_direct  # noqa: E402
 from src.methods.self_consistency import run_self_consistency  # noqa: E402
 from src.model_runner import ModelRunner  # noqa: E402
+from src.multi_agent.debate import run_debate  # noqa: E402
+from src.multi_agent.pev import run_pev  # noqa: E402
 from src.results_io import save_run_result  # noqa: E402
 
 METHOD_RUNNERS = {
     "direct": run_direct,
     "cot": run_cot,
     "self_consistency": run_self_consistency,
+    "debate": run_debate,
+    "pev": run_pev,
 }
+
+# debate/pev 的入口签名是 (runner, questions, *, seed, config=None),没有
+# max_tokens/enable_thinking(max_tokens 由角色内部固定用 ModelConfig().max_tokens,
+# enable_thinking 角色内部统一传 None 交给模型自己决定),跟三个基线的
+# (runner, questions, *, max_tokens, seed, enable_thinking=None) 不一样,调用时要分开处理。
+MULTI_AGENT_METHODS = {"debate", "pev"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -81,13 +91,16 @@ def main() -> None:
 
     try:
         for seed in seeds:
-            run_result = run_fn(
-                runner,
-                questions,
-                max_tokens=model_config.max_tokens,
-                seed=seed,
-                enable_thinking=args.enable_thinking,
-            )
+            if args.method in MULTI_AGENT_METHODS:
+                run_result = run_fn(runner, questions, seed=seed)
+            else:
+                run_result = run_fn(
+                    runner,
+                    questions,
+                    max_tokens=model_config.max_tokens,
+                    seed=seed,
+                    enable_thinking=args.enable_thinking,
+                )
             save_run_result(run_result, results_dir)
     finally:
         # 确保 vLLM 子进程被清理,避免孤儿进程占用显存(参见 LEARNING_NOTES.md)

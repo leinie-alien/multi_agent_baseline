@@ -23,6 +23,9 @@ class QuestionRecord:
     finish_reasons: list[str] = field(default_factory=list)  # 每个采样对应的 vLLM finish_reason,"length" 表示被 max_tokens 截断
     samples: list[str] | None = None  # 仅 Self-Consistency 填充:每个采样的提取答案
     vote_result: str | None = None  # 仅 Self-Consistency 填充
+    rounds_used: int = 1  # 仅多智能体方法填充:该题实际跑了几轮(受益于早停/未触发满量反馈轮次)
+    agent_trace: list[dict] = field(default_factory=list)  # 仅多智能体方法填充:每轮每个角色的输出记录,元素形如
+    # {"round": int, "role": str, "text": str, "output_tokens": int, "finish_reason": str}
 
 
 @dataclass

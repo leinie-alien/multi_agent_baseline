@@ -858,3 +858,166 @@ DEFAULT_SEEDS: list[int] = [41, 42, 43]
 所以结论是:`repetition_penalty=1.05` 是在压"同一句话反复讲"这种退化循环,对 q161 这种"分支本身就多、写不完"的情况没用武之地——不管 `max_tokens` 调多大,这道题都有可能刚好不够用。这类 case 目前的处理方式是让它保持 `truncation_rate` 不为 0,靠 `extract_answer.py` 的 `allow_fallback`(按 `finish_reason == "length"` 关掉兜底)诚实返回 `None`,而不是从截断处硬凑一个假答案;`self_consistency` 还能靠多个样本投票把这类偶发截断吃掉。真要把 q161 的 truncation_rate 压到 0,得从"限制分支探索的写法"或者"接受这道题在 direct/cot 下就是会失败"这个方向想,单纯加大 `max_tokens` 治不了。
 
 ---
+
+## 2026-09-22: 三个基线方法的实验结果对比与启示
+
+### 实验背景
+
+在 Qwen3.5-9B(tensor_parallel_size=2)上,对 MATH-500 的 200 题子集,跑了三个基线方法:**Direct**(直接回答)、**CoT**(逐步推理)、**Self-Consistency**(N=5投票)。每个方法用 3 个 seed(41/42/43)各跑一遍,共 9 次实验完成。
+
+### 核心数据
+
+| 指标 | Direct | CoT | Self-Consistency |
+|------|--------|-----|------------------|
+| 平均准确率 | 94.17% | 94.00% | **95.00%** |
+| 准确率稳定性 | ±0.76% | ±0.00% | ±0.00% |
+| 平均 token/题 | 2,602 | 7,209 | 36,143 |
+| Token 效率* | **0.362** | 0.130 | 0.026 |
+| 截断率 | 4.33% | 2.50% | 2.00% |
+
+*Token 效率 = 准确率 / (平均 tokens ÷ 1000)
+
+### 五个关键发现
+
+#### 1. **Self-Consistency 投票机制的稳定性压倒一切**
+
+Self-Consistency 的 3 个 seed 精确相同都是 95.00% 准确率(**变异系数 0%**),而 Direct 在三个 seed 之间波动 ±0.76%(93.50% 到 95.00%)。
+
+**为什么**:Self-Consistency 通过 N=5 投票把单个样本的波动平滑掉了。CoT 之所以也是 ±0.00% 是因为三个 seed 的准确率碰巧都是 94.00%,不是说 CoT 本身更稳定——从数据上看 Direct 在三个 seed 实际表现上更有波动,但投票机制吃掉了这种波动。
+
+**启示**:虽然 Self-Consistency 的平均 token 成本最高(36k),但用投票换稳定性在某些场景下值得。对后续的 Debate/PEV 设计来说,多智能体协作如果能像投票一样"消除个别样本的歪斜",可能也会有类似的稳定性收益。
+
+#### 2. **Direct 是 token 效率之王,但代价是准确率偏低**
+
+Direct 每题平均 2,602 token,是 CoT 的 36%、Self-Consistency 的 7.2%。但它的准确率(94.17%)介于 CoT(94.00%)和 Self-Consistency(95.00%)之间。
+
+**Token 效率对比**:
+- Direct: **0.362** (最高效)
+- CoT: 0.130
+- Self-Consistency: 0.026 (最低效)
+
+**启示**:在资源受限的场景(比如线上推理延迟/成本敏感),Direct 虽然给不了最高准确率,但性价比最优。对多智能体方法来说,如果多个简单智能体(比如 Debate 里的三个 Solver)不投更多 token,纯靠"协作机制"来提升准确率,那这部分的 token 成本不会显著增加——价值就在于协作的 overhead 能不能通过改进答案质量收回来。
+
+#### 3. **CoT 的隐形优势:截断率最低**
+
+CoT 的截断率是 2.50%(最低),Direct 是 4.33%(最高),Self-Consistency 是 2.00%(次低)。
+
+这看起来和"CoT 的 token 数最多"矛盾——token 多应该更容易截断。但实际上:
+
+| 方法 | 平均 output_tokens | 截断率 | 推论 |
+|------|------------------|--------|------|
+| Direct | 2,568 | 4.33% | 虽然 token 少,但某些难题一次就探索完,会碰到"该截断却没截"的罕见情况? |
+| CoT | 7,261 | 2.50% | token 更多反而截断少,说明 CoT 的输出模式更"温和",不容易一次性冲满 32k token |
+| Self-Consistency | 35,407 | 2.00% | N=5 投票制也有同样效果 |
+
+**启示**:截断率的高低不完全由平均 token 决定,和**输出的方差**也有关。Direct 虽然平均 token 少,但偏差大(有的题目很短,有的题目长),所以在 seed 42 这次碰巧有题目接近 32k 上限就被截断;CoT 更"机械"地按步骤推理,输出更均匀,反而不容易撞上上限。
+
+对 Debate/PEV 的设计含义:**多轮对话** 能不能通过"每轮都短一点,分散成多轮"的方式,既保证充分讨论,又不容易触发单轮截断?
+
+#### 4. **Seed 41/42/43 的微观波动反映出采样的本质随机性**
+
+Direct 三个 seed 的准确率分别是 94.00% / 95.00% / 93.50%,虽然平均只差 1.5%,但这 1.5% 在 200 题里就是 3 题的差异(题目被模型判错/判对的概率在不同采样下确实会变化)。
+
+CoT 和 Self-Consistency 各 seed 都相同,看起来像是巧合(**种子本身没有导致输出差异**),但更可能是:
+- **CoT**: 虽然也是采样,但逻辑推理的链条更受输入/prompt 制约,seed 的影响通过 temperature 放大的空间有限
+- **Self-Consistency**: 5 条投票把单条样本的波动吃掉了
+
+**启示**:多智能体协作里,如果各个智能体都用同一个 seed,或者多个 seed 之间的差异被聚合消除(如投票、取中位数),那结果也会表现出这种"表面稳定"。但这不等于系统本身稳定——只是把波动隐藏在内部了。
+
+#### 5. **准确率天花板可能就在 95% 左右**
+
+三个方法中最高的是 Self-Consistency 的 95.00%。Direct 和 CoT 都在 94% 附近。
+
+这可能反映出:
+- **200 题子集本身的难度分布** 可能有 5% 左右的题目是 9B 模型在这个 temperature/max_tokens 设置下"天然答不对"的(可能需要更大模型、或者更细致的 prompt 设计)
+- **Self-Consistency 的投票**能从平均 94% 提升到 95%,gain 只有 1%,说明 N=5 能吃掉的波动有限
+
+**启示**:后续跑 Debate/PEV 时,如果准确率能突破 95% 进入 96%+,那说明多智能体协作真的在"互相纠正"上有效果(不是单纯的投票放大);如果卡在 95% 以下,要考虑是协作机制有问题,还是这道题对 9B 模型本身就太难。
+
+### 一句话总结
+
+**单样本有波动,投票消波动,但代价是 token 成本翻倍。后续多智能体方法的价值衡量标准:能否用比投票更省 token 的协作机制来逼近或超过 Self-Consistency 的 95%+准确率。**
+
+---
+
+## 2026-09-22: 排查 thinking 模式有没有生效,搜错了标签方向
+
+### 现象
+
+跑完三个基线后回头想确认:CoT/Self-Consistency 到底有没有用上 Qwen3.5-9B 的原生 thinking 模式(`enable_thinking=None` 是交给模型自己决定)。第一次排查直接 `grep "<think>" per_question.jsonl`,结果 6 个 sanity_check 目录 + 正式跑的结果全都是 **0 命中**,于是先得出了一个错误结论:"模型没用 thinking,重不重跑无所谓"。
+
+### 搞错的地方
+
+`<think>` **开标签不会出现在模型的输出里**。看 `src/model_runner.py:100-108` 的 `build_prompt`:
+
+```python
+def build_prompt(self, messages: list[dict], enable_thinking: bool | None = None) -> str:
+    """enable_thinking=None(默认)时不传这个参数给模板,由模型自己决定要不要思考
+    (对应 chat_template.jinja 里 `enable_thinking is defined` 为假的分支,插入未闭合
+    的 `<think>\n`)。显式传 False 会让模板插入已闭合的空 `<think>\n\n</think>\n\n`,
+    跳过思考阶段直接进入正式回答。"""
+    kwargs = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
+    return self.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, **kwargs
+    )
+```
+
+`enable_thinking=None` 时,chat template 会在**发给模型的 prompt 末尾**插入一个未闭合的 `<think>\n`,相当于"提示模型:接下来你可以开始思考"。这个开标签是 prompt 的一部分,不是 completion 的一部分,所以 vLLM 返回的 `raw_outputs`(也就是 `per_question.jsonl` 里存的内容)**天然不会包含这个开标签**——不管模型有没有真的思考,搜开标签永远是 0,这个信号本身就没有区分力。
+
+真正该搜的是模型**自己写的闭合标签** `</think>`:如果模型选择走 thinking 分支,它会在思考完之后自己吐出 `</think>` 再进入正式回答;如果 `enable_thinking=False`(模板已经塞了闭合的空 `<think>\n\n</think>\n\n`),模型不会再自己写一次。
+
+### 重新验证后的真实结论
+
+```bash
+grep -c "</think>" results/cot/run_seed41/per_question.jsonl              # 197/200
+grep -c "</think>" results/self_consistency/run_seed41/per_question.jsonl # 200/200
+grep -c "</think>" results/direct/run_seed41/per_question.jsonl           # 3/200(强制关闭后的噪声)
+```
+
+**CoT 和 Self-Consistency 几乎每一题都触发了 thinking 模式**,只有 `direct` 是真正被强制关闭的。也就是说之前"CoT vs Direct"的对比,实际上是"prompt 层面的 CoT 要求 + 模型原生 thinking"叠加效果 vs "无 thinking 的直接回答",没有把这两个变量隔离开。
+
+### 教训
+
+1. **判断某个 tag 有没有生效,先搞清楚这个 tag 是加在 prompt 侧还是 completion 侧**,搜错了地方会拿到一个"看似确定、实际毫无信息量"的全零结果,还很容易顺着这个假结果编出一个错误但自洽的解释。
+2. **第一次分析错了要主动纠正,不要因为"看起来已经有个说得通的结论"就停下来**——这次是用户追问"你确定吗,sanity check 时我明明看到过 thinking" 才发现问题,说明"数据摆在眼前"不代表"分析角度是对的"。
+3. 处理办法:不重跑已有数据(占的 GPU 时间已经花了,结果依然有效,只是要标注清楚"CoT/Self-Consistency 默认允许 thinking"),额外补跑一组 `--disable-thinking` 的对照数据存到 `results_no_thinking/`(用 `--results-dir` 隔离,不覆盖原结果),两组数据都留着,具体命令见 `EXPERIMENT_COMMANDS.md`。
+
+---
+
+## 2026-09-23: PEV 第一次 sanity check 崩溃——策略解析没校验数量,把 thinking 草稿也切成了"策略"
+
+### 现象
+
+`debate`/`pev` 接入 `METHOD_RUNNERS` 后第一次真实上 GPU 跑 sanity check:
+
+```bash
+CUDA_VISIBLE_DEVICES=2,3 python scripts/run_experiment.py --method pev --limit 5 --seeds 41 --results-dir results/sanity_check
+```
+
+前两批 generate 调用都正常跑完(第一批 5 个 prompt,应为 planner;第二批 **104 个** prompt),第三批(verifier)刚起步就崩:
+
+```
+vllm.exceptions.VLLMValidationError: This model's maximum context length is 36864 tokens.
+However, you requested 0 output tokens and your prompt contains at least 36865 input tokens,
+for a total of at least 36865 tokens.
+```
+
+第二批 104 个 prompt 是第一个异常信号:`--limit 5` 题、`PEVConfig.num_strategies=2`,executor 阶段正常应该是 5×2=10 个 prompt,104 个明显不对。
+
+### 根因(委托 Codex 定位,只读排查未改代码)
+
+1. **`src/multi_agent/roles.py` 的 `_parse_strategies(text, expected)` 完全没用 `expected` 参数做数量校验**,而是对全文任意位置出现的 `Strategy N:` 都切一段,包括模型 thinking 草稿里提到的字样、以及第一个标记之前的所有前导文本也被当成一段策略。Codex 用最小复现验证:一段"thinking 草稿提到 Strategy 1/2 + `</think>` 后正式给出 Strategy 1/2 最终版"的文本,被解析成了 **5 个**"策略"(而不是预期的 2 个)。
+2. executor 阶段对解析出的每个片段都发一次请求,没有任何数量上限,5 题 × (每题被解析出的策略数,含垃圾片段)累加起来正好是 104。
+3. verifier 阶段的 prompt 会把"该题全部候选策略的原文 + executor 完整输出"原样拼接进去(`roles.py:304-325`)——候选数量本该是 2,失控后变成 5+,加上每份都是未剥离 thinking 的完整原文,单题 prompt 直接冲上 36864 上限。
+4. 报错信息里 `0 output tokens`/`36865` 不是项目代码把生成预算 clamp 到了 0——那是 vLLM 内部输入校验用的独立 `TokenizeParams.max_output_tokens`(默认值就是 0),被拒绝时打印的是这个字段,不代表项目自己算出的 `max_tokens`(固定 32000,详见 `config.py`/`roles.py:22`)。`36865` 只是"探测到超限即报"的下界,真实长度可能远超此数。真正的问题是:`src/model_runner.py` 的 `generate()` 从头到尾没有对 prompt 长度做任何计算/预算管理,超没超都直接发请求。
+5. 连带发现一个独立 bug:`scripts/run_experiment.py` 的 `--disable-thinking` 只传给了三个基线方法,**没有传给 `debate`/`pev`**(`MULTI_AGENT_METHODS` 分支里 `run_fn(runner, questions, seed=seed)` 没带这个参数)。也就是说这次 sanity check 命令里就算加了 `--disable-thinking` 对 PEV 也不会生效,thinking 依然开着——这不是这次崩溃的根因(根因是策略解析没做数量校验),但会放大问题(thinking 草稿越长,被误切进"策略"列表的垃圾片段就越多)。
+
+### 教训
+
+1. **多智能体角色间的输出解析,必须用传入的期望值(`expected`)做强校验,不能只靠正则切分"看起来像"的模式**——模型在 thinking 模式下会在草稿里提前"预告"格式关键字(比如提到 `Strategy 1`/`Strategy 2` 打草稿),纯文本模式匹配分不清"这是草稿里提到的" vs "这是正式给出的最终策略"。
+2. **多智能体协作的 prompt 拼接(把上一阶段完整输出喂给下一阶段)必须有长度预算意识**,不能假设"角色输出不会太长"——尤其是没有关闭 thinking 时,单次输出可能就有几千 token,多个角色/多个候选原样拼接极易线性甚至更快地吃满 context window。
+3. **观察 batch 数量是最便宜的健康检查**:跑 sanity check 时,`--limit 5` 配 `num_strategies=2` 应该让人一眼看出"第二批该是 10 个 prompt",104 这个数字在日志刷过去的瞬间就该被抓出来,不用等到第三批真的报错才发现问题。
+4. **给多智能体分支加新参数(比如 `--disable-thinking`)时,要检查所有分支入口是不是都接上了**,不能只改其中一条调用路径——这次 `run_experiment.py` 里 `MULTI_AGENT_METHODS` 和普通方法用的是两条不同的调用分支,加参数时漏了一条。
+5. 修复顺序(还没做,下一步):先修 `_parse_strategies` 使其严格按 `expected` 数量提取最终答案(排除 thinking 内容),再给角色间传递的上下文加预算管理(摘要/截断而非全文拼接),最后把 `--disable-thinking` 接到 `debate`/`pev` 分支。改完后要重新跑一次同样的 `--limit 5` sanity check 验证 batch 数量和是否还会超限,再上 200 题正式跑。
+
+---
