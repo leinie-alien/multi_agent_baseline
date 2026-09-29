@@ -362,3 +362,79 @@ def test_run_pev_builds_question_record():
     assert record.total_tokens == record.input_tokens + record.output_tokens
     assert record.rounds_used == 3
     assert len(record.agent_trace) == 4
+
+
+def test_parse_strategies_ignores_thinking_and_preamble_and_caps_count():
+    text = ('<think>Strategy 1: draft\nStrategy 2: another draft</think>\n'
+            'Here are the strategies.\nStrategy 1: A\nStrategy 2: B\nStrategy 3: C')
+    assert _parse_strategies(text, 2) == ['A', 'B']
+    assert _parse_strategies('draft Strategy 7: bad</think>\nStrategy 1: A\nStrategy 2: B', 2) == ['A', 'B']
+
+
+def test_parse_strategies_uses_available_count_when_short():
+    assert _parse_strategies('Introduction\nStrategy 1: A', 2) == ['A']
+    assert _parse_strategies('<think>Strategy 1: draft</think>Use algebra', 2) == ['Use algebra']
+    assert _parse_strategies('<think>Strategy 1: unfinished', 2) == ['']
+    assert _parse_strategies('Strategy 1: A', 0) == []
+
+
+def test_role_context_budget_preserves_head_tail_and_removes_thinking():
+    from src.multi_agent.roles import (
+        _bounded_context, build_executor_messages, build_verifier_messages,
+        build_planner_feedback_messages, build_critic_messages,
+        build_refine_messages, build_judge_messages,
+    )
+
+    long_text = '<think>' + 'draft' * 1000 + '</think>HEAD' + 'x' * 10000 + 'TAIL'
+    bounded = _bounded_context([long_text] * 4, 400)
+    assert sum(map(len, bounded)) == 400
+    assert all(t.startswith('HEAD') and t.endswith('TAIL') for t in bounded)
+    assert all('[truncated]' in t and 'draft' not in t for t in bounded)
+    messages = [
+        build_executor_messages('problem', long_text, 400),
+        build_verifier_messages('problem', [long_text] * 2, [long_text] * 2, 400),
+        build_planner_feedback_messages('problem', 2, [long_text] * 2, long_text, 400),
+        build_critic_messages('problem', [long_text] * 3, 400),
+        build_refine_messages('problem', long_text, long_text, 400),
+        build_judge_messages('problem', [long_text] * 3, 400),
+    ]
+    for message in messages:
+        content = message[0]['content']
+        assert len(content) < 1600
+        assert '[truncated]' in content and 'draft' not in content
+        assert 'HEAD' in content and 'TAIL' in content
+
+
+def test_thinking_override_reaches_all_roles_and_feedback():
+    class ThinkingRunner(SequencedRunner):
+        def build_prompt(self, messages, enable_thinking=None):
+            assert enable_thinking is thinking
+            return super().build_prompt(messages, enable_thinking)
+
+    for thinking in (None, False, True):
+        debate_runner = ThinkingRunner([
+            [sample('2'), sample('3'), sample('4')], [plain('feedback')],
+            [sample('2'), sample('3'), sample('4')], [sample('2')],
+        ])
+        run_debate(debate_runner, [_question()], seed=41, enable_thinking=thinking)
+        pev_runner = ThinkingRunner([
+            [plain('Strategy 1: A\nStrategy 2: B')], [sample('2'), sample('3')],
+            [plain('FAIL')], [plain('Strategy 1: C\nStrategy 2: D')],
+            [sample('2'), sample('2')], [sample('2')],
+        ])
+        result = run_pev(pev_runner, [_question()], seed=41, enable_thinking=thinking)
+        assert len(result.records[0].agent_trace) == 8
+
+
+def test_pev_five_questions_have_ten_executor_prompts_with_polluted_plans():
+    planner_text = '<think>' + 'Strategy 1: draft\n' * 20 + '</think>\nIntro\nStrategy 1: A\nStrategy 2: B\nStrategy 3: excess'
+    runner = SequencedRunner([
+        [plain(planner_text) for _ in range(5)],
+        [sample('2') for _ in range(10)],
+        [sample('2') for _ in range(5)],
+    ])
+    result = run_pev(runner, [_question(question_id=f'q{i}') for i in range(5)], seed=41)
+    assert [call['num_prompts'] for call in runner.calls] == [5, 10, 5]
+    for record in result.records:
+        assert sum(t['role'].startswith('executor_') for t in record.agent_trace) == 2
+        assert record.agent_trace[0]['text'] == planner_text

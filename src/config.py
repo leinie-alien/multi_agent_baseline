@@ -54,6 +54,7 @@ class DebateConfig:
     refine_temperature: float = 0.6
     judge_temperature: float = 0.3
     repetition_penalty: float = 1.05
+    max_context_chars: int = 6000  # 角色间共享字符预算,为题目和模板预留上下文空间
 
 
 @dataclass
@@ -70,6 +71,7 @@ class PEVConfig:
     executor_temperature: float = 0.3
     verifier_temperature: float = 0.3
     repetition_penalty: float = 1.05
+    max_context_chars: int = 6000  # 角色间共享字符预算,避免长输出累积撑满上下文
 
 # 每种方法重复运行的次数与对应 seed(seed 与重复次数一一对应,不同 repeat 用不同 seed
 # 以产生真实的采样波动,同时保证结果可复现)。

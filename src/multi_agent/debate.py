@@ -14,10 +14,11 @@ def run_debate(
     questions: list[dict],
     *,
     seed: int,
+    enable_thinking: bool | None = None,
     config: DebateConfig | None = None,
 ) -> RunResult:
     config = config or DebateConfig()
-    next_phase_fn, apply_fn = make_debate_functions(config)
+    next_phase_fn, apply_fn = make_debate_functions(config, enable_thinking=enable_thinking)
 
     states = run_agent_loop(
         runner,

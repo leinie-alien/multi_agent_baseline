@@ -41,10 +41,7 @@ METHOD_RUNNERS = {
     "pev": run_pev,
 }
 
-# debate/pev 的入口签名是 (runner, questions, *, seed, config=None),没有
-# max_tokens/enable_thinking(max_tokens 由角色内部固定用 ModelConfig().max_tokens,
-# enable_thinking 角色内部统一传 None 交给模型自己决定),跟三个基线的
-# (runner, questions, *, max_tokens, seed, enable_thinking=None) 不一样,调用时要分开处理。
+# 多智能体的输出预算由角色内部控制,因此与基线入口分开调用。
 MULTI_AGENT_METHODS = {"debate", "pev"}
 
 
@@ -59,11 +56,11 @@ def parse_args() -> argparse.Namespace:
     thinking_group = parser.add_mutually_exclusive_group()
     thinking_group.add_argument(
         "--enable-thinking", dest="enable_thinking", action="store_true", default=None,
-        help="强制开启思考(仅对 cot/self_consistency 有效,direct 始终关闭)",
+        help="强制开启思考(对 cot/self_consistency/debate/pev 有效,direct 始终关闭)",
     )
     thinking_group.add_argument(
         "--disable-thinking", dest="enable_thinking", action="store_false",
-        help="强制关闭思考(仅对 cot/self_consistency 有效,direct 始终关闭)",
+        help="强制关闭思考(对 cot/self_consistency/debate/pev 有效,direct 始终关闭)",
     )
     return parser.parse_args()
 
@@ -92,7 +89,7 @@ def main() -> None:
     try:
         for seed in seeds:
             if args.method in MULTI_AGENT_METHODS:
-                run_result = run_fn(runner, questions, seed=seed)
+                run_result = run_fn(runner, questions, seed=seed, enable_thinking=args.enable_thinking)
             else:
                 run_result = run_fn(
                     runner,

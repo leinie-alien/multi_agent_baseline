@@ -22,6 +22,38 @@ from .orchestrator import AgentState, ApplyFn, NextPhaseFn, PhaseStep
 _MAX_TOKENS = ModelConfig().max_tokens
 
 
+def _formal_answer(text: str) -> str:
+    # chat template 可能已消费开标签,因此只有闭标签时也应排除思考草稿。
+    parts = re.split(r"</think\s*>", text, flags=re.IGNORECASE)
+    if len(parts) > 1:
+        return parts[-1].strip()
+    if re.search(r"<think\s*>", text, flags=re.IGNORECASE):
+        return ""  # 未闭合的草稿没有正式策略,不能把其中的标记当成候选。
+    return text.strip()
+
+
+def _bounded_context(texts: list[str], max_chars: int = 6000) -> list[str]:
+    # 所有候选共享预算,避免候选数增大时总长度再次失控。6000 字符即使按
+    # UTF-8 最坏的每字符 4 token 估计也留有题目和模板空间;头尾兼顾思路和最终答案。
+    if max_chars < 1:
+        raise ValueError("max_context_chars must be positive")
+    budget = max_chars // max(1, len(texts))
+    marker = "\n...[truncated]...\n"
+    result = []
+    for text in texts:
+        text = _formal_answer(text)
+        if len(text) > budget:
+            if budget <= len(marker):
+                text = text[:budget]
+            else:
+                keep = budget - len(marker)
+                head = (keep + 1) // 2
+                tail = keep // 2
+                text = text[:head] + marker + (text[-tail:] if tail else "")
+        result.append(text)
+    return result
+
+
 def _extract(sample) -> str | None:
     # 被截断的采样禁用兜底提取规则,理由与 methods/base.py 的同名处理一致
     # (截断点附近的数字不代表模型的真实结论)。
@@ -80,7 +112,8 @@ def build_solver_messages(problem: str) -> list[dict]:
     return [{"role": "user", "content": content}]
 
 
-def build_critic_messages(problem: str, solver_texts: list[str]) -> list[dict]:
+def build_critic_messages(problem: str, solver_texts: list[str], max_context_chars: int = 6000) -> list[dict]:
+    solver_texts = _bounded_context(solver_texts, max_context_chars)
     solutions = "\n\n".join(
         f"--- Solver {i + 1}'s solution ---\n{text}" for i, text in enumerate(solver_texts)
     )
@@ -96,7 +129,8 @@ def build_critic_messages(problem: str, solver_texts: list[str]) -> list[dict]:
     return [{"role": "user", "content": content}]
 
 
-def build_refine_messages(problem: str, own_text: str, critic_text: str) -> list[dict]:
+def build_refine_messages(problem: str, own_text: str, critic_text: str, max_context_chars: int = 6000) -> list[dict]:
+    own_text, critic_text = _bounded_context([own_text, critic_text], max_context_chars)
     content = (
         "You previously solved the math problem below. A critic has since reviewed "
         "multiple solvers' solutions, including yours, and left feedback. Reconsider "
@@ -112,7 +146,8 @@ def build_refine_messages(problem: str, own_text: str, critic_text: str) -> list
     return [{"role": "user", "content": content}]
 
 
-def build_judge_messages(problem: str, refined_texts: list[str]) -> list[dict]:
+def build_judge_messages(problem: str, refined_texts: list[str], max_context_chars: int = 6000) -> list[dict]:
+    refined_texts = _bounded_context(refined_texts, max_context_chars)
     solutions = "\n\n".join(
         f"--- Refined solution {i + 1} ---\n{text}" for i, text in enumerate(refined_texts)
     )
@@ -127,7 +162,7 @@ def build_judge_messages(problem: str, refined_texts: list[str]) -> list[dict]:
     return [{"role": "user", "content": content}]
 
 
-def make_debate_functions(config: DebateConfig) -> tuple[NextPhaseFn, ApplyFn]:
+def make_debate_functions(config: DebateConfig, enable_thinking: bool | None = None) -> tuple[NextPhaseFn, ApplyFn]:
     """构造 Debate 流程的 next_phase_fn/apply_fn。
 
     固定阶段顺序 solve -> critic -> refine -> judge,长度由 config.max_rounds 截断
@@ -152,6 +187,7 @@ def make_debate_functions(config: DebateConfig) -> tuple[NextPhaseFn, ApplyFn]:
                     temperature=config.solver_temperature,
                     max_tokens=_MAX_TOKENS,
                     repetition_penalty=config.repetition_penalty,
+                    enable_thinking=enable_thinking,
                 )
                 for i in range(config.num_solvers)
             ]
@@ -160,10 +196,11 @@ def make_debate_functions(config: DebateConfig) -> tuple[NextPhaseFn, ApplyFn]:
             return [
                 PhaseStep(
                     role="critic",
-                    messages=build_critic_messages(problem, state.scratch["solver_texts"]),
+                    messages=build_critic_messages(problem, state.scratch["solver_texts"], config.max_context_chars),
                     temperature=config.critic_temperature,
                     max_tokens=_MAX_TOKENS,
                     repetition_penalty=config.repetition_penalty,
+                    enable_thinking=enable_thinking,
                 )
             ]
 
@@ -172,10 +209,11 @@ def make_debate_functions(config: DebateConfig) -> tuple[NextPhaseFn, ApplyFn]:
             return [
                 PhaseStep(
                     role=f"refine_{i}",
-                    messages=build_refine_messages(problem, text, critic_text),
+                    messages=build_refine_messages(problem, text, critic_text, config.max_context_chars),
                     temperature=config.refine_temperature,
                     max_tokens=_MAX_TOKENS,
                     repetition_penalty=config.repetition_penalty,
+                    enable_thinking=enable_thinking,
                 )
                 for i, text in enumerate(state.scratch["solver_texts"])
             ]
@@ -184,10 +222,11 @@ def make_debate_functions(config: DebateConfig) -> tuple[NextPhaseFn, ApplyFn]:
         return [
             PhaseStep(
                 role="judge",
-                messages=build_judge_messages(problem, state.scratch["refined_texts"]),
+                messages=build_judge_messages(problem, state.scratch["refined_texts"], config.max_context_chars),
                 temperature=config.judge_temperature,
                 max_tokens=_MAX_TOKENS,
                 repetition_penalty=config.repetition_penalty,
+                enable_thinking=enable_thinking,
             )
         ]
 
@@ -271,7 +310,11 @@ def build_planner_feedback_messages(
     num_strategies: int,
     executor_texts: list[str],
     verifier_feedback: str,
+    max_context_chars: int = 6000,
 ) -> list[dict]:
+    *executor_texts, verifier_feedback = _bounded_context(
+        [*executor_texts, verifier_feedback], max_context_chars
+    )
     attempts = "\n\n".join(
         f"--- Previous attempt {i + 1} ---\n{text}" for i, text in enumerate(executor_texts)
     )
@@ -290,7 +333,8 @@ def build_planner_feedback_messages(
     return [{"role": "user", "content": content}]
 
 
-def build_executor_messages(problem: str, strategy: str) -> list[dict]:
+def build_executor_messages(problem: str, strategy: str, max_context_chars: int = 6000) -> list[dict]:
+    strategy, = _bounded_context([strategy], max_context_chars)
     content = (
         "Carry out the following solution strategy fully and carefully for the math "
         "problem below. Show all computation steps.\n\n"
@@ -305,7 +349,10 @@ def build_verifier_messages(
     problem: str,
     strategies: list[str],
     executor_texts: list[str],
+    max_context_chars: int = 6000,
 ) -> list[dict]:
+    bounded = _bounded_context([*strategies, *executor_texts], max_context_chars)
+    strategies, executor_texts = bounded[:len(strategies)], bounded[len(strategies):]
     candidates = "\n\n".join(
         f"--- Candidate {i + 1} (strategy: {strat}) ---\n{text}"
         for i, (strat, text) in enumerate(zip(strategies, executor_texts))
@@ -326,14 +373,18 @@ def build_verifier_messages(
 
 
 def _parse_strategies(text: str, expected: int) -> list[str]:
-    """按 "Strategy N:" 前缀切分 planner 输出。格式不规范时(没切出任何片段)整段文本
-    当成唯一一条策略,保证下游 executor 阶段至少有一条可执行的策略。
-    """
-    parts = [p.strip() for p in _STRATEGY_SPLIT_RE.split(text) if p.strip()]
-    return parts if parts else [text.strip()]
+    """只取正式回答中的策略;不足时用实际数量,超额时裁剪,无标记时用正式全文。"""
+    if expected <= 0:
+        return []
+    text = _formal_answer(text)
+    matches = list(_STRATEGY_SPLIT_RE.finditer(text))
+    parts = [text[m.end():matches[i + 1].start() if i + 1 < len(matches) else len(text)].strip()
+             for i, m in enumerate(matches)]
+    parts = [part for part in parts if part]
+    return (parts or [text])[:expected]
 
 
-def make_pev_functions(config: PEVConfig) -> tuple[NextPhaseFn, ApplyFn]:
+def make_pev_functions(config: PEVConfig, enable_thinking: bool | None = None) -> tuple[NextPhaseFn, ApplyFn]:
     """构造 PEV 流程的 next_phase_fn/apply_fn。
 
     stage_to_run 在 plan -> execute -> verify 之间循环;verify 阶段解析出
@@ -353,7 +404,8 @@ def make_pev_functions(config: PEVConfig) -> tuple[NextPhaseFn, ApplyFn]:
                 messages = build_planner_messages(problem, config.num_strategies)
             else:
                 messages = build_planner_feedback_messages(
-                    problem, config.num_strategies, state.scratch["executor_texts"], feedback
+                    problem, config.num_strategies, state.scratch["executor_texts"], feedback,
+                    config.max_context_chars
                 )
             return [
                 PhaseStep(
@@ -362,6 +414,7 @@ def make_pev_functions(config: PEVConfig) -> tuple[NextPhaseFn, ApplyFn]:
                     temperature=config.planner_temperature,
                     max_tokens=_MAX_TOKENS,
                     repetition_penalty=config.repetition_penalty,
+                    enable_thinking=enable_thinking,
                 )
             ]
 
@@ -370,10 +423,11 @@ def make_pev_functions(config: PEVConfig) -> tuple[NextPhaseFn, ApplyFn]:
             return [
                 PhaseStep(
                     role=f"executor_{i}",
-                    messages=build_executor_messages(problem, strategy),
+                    messages=build_executor_messages(problem, strategy, config.max_context_chars),
                     temperature=config.executor_temperature,
                     max_tokens=_MAX_TOKENS,
                     repetition_penalty=config.repetition_penalty,
+                    enable_thinking=enable_thinking,
                 )
                 for i, strategy in enumerate(strategies)
             ]
@@ -383,11 +437,13 @@ def make_pev_functions(config: PEVConfig) -> tuple[NextPhaseFn, ApplyFn]:
             PhaseStep(
                 role="verifier",
                 messages=build_verifier_messages(
-                    problem, state.scratch["strategies"], state.scratch["executor_texts"]
+                    problem, state.scratch["strategies"], state.scratch["executor_texts"],
+                    config.max_context_chars
                 ),
                 temperature=config.verifier_temperature,
                 max_tokens=_MAX_TOKENS,
                 repetition_penalty=config.repetition_penalty,
+                enable_thinking=enable_thinking,
             )
         ]
 

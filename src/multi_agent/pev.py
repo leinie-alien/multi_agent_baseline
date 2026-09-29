@@ -18,10 +18,11 @@ def run_pev(
     questions: list[dict],
     *,
     seed: int,
+    enable_thinking: bool | None = None,
     config: PEVConfig | None = None,
 ) -> RunResult:
     config = config or PEVConfig()
-    next_phase_fn, apply_fn = make_pev_functions(config)
+    next_phase_fn, apply_fn = make_pev_functions(config, enable_thinking=enable_thinking)
     max_outer_rounds = (config.max_feedback_rounds + 1) * _STAGES_PER_CYCLE
 
     states = run_agent_loop(
