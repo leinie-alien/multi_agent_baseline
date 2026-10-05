@@ -55,6 +55,17 @@ def plain(text: str, output_tokens: int = 10, finish_reason: str = "stop") -> Sa
     return SampleResult(text=text, output_tokens=output_tokens, finish_reason=finish_reason)
 
 
+def verify_pass(answer: str, output_tokens: int = 10, finish_reason: str = "stop") -> SampleResult:
+    """PEV verifier 判通过的样本:必须同时有 Overall: PASS 判决和 boxed 答案,
+    只有 boxed 不足以代表通过(这正是 2026-10-05 修复的 bug,见 LEARNING_NOTES.md)。
+    """
+    return SampleResult(
+        text=f"Candidate checks out.\nOverall: PASS\n\\boxed{{{answer}}}",
+        output_tokens=output_tokens,
+        finish_reason=finish_reason,
+    )
+
+
 def _question(answer="2", question_id="q1", level=5, problem="1+1=?"):
     return {"question_id": question_id, "level": level, "problem": problem, "answer": answer}
 
@@ -252,7 +263,7 @@ def test_pev_verify_pass_first_try():
     runner = SequencedRunner([
         [plain("Strategy 1: algebra\nStrategy 2: substitution")],  # plan
         [sample("4"), sample("4")],                                    # execute
-        [sample("4")],                                                 # verify: 通过
+        [verify_pass("4")],                                             # verify: 通过
     ])
     config = PEVConfig()
     next_phase_fn, apply_fn = make_pev_functions(config)
@@ -275,7 +286,7 @@ def test_pev_verify_fail_then_feedback_then_pass():
         [plain("both candidates FAIL, no boxed answer")],   # verify 1: 失败,无 boxed
         [plain("Strategy 1: C\nStrategy 2: D")],          # plan 2(带反馈)
         [sample("9"), sample("9")],                          # execute 2
-        [sample("9")],                                       # verify 2: 通过
+        [verify_pass("9")],                                  # verify 2: 通过
     ])
     config = PEVConfig()
     next_phase_fn, apply_fn = make_pev_functions(config)
@@ -309,6 +320,33 @@ def test_pev_verify_exhausted_falls_back_to_executor_majority_vote():
 
     state = states[0]
     assert state.final_prediction == "5"  # 退化为最后一次 executor 答案的多数票
+    assert state.round_idx == 6
+
+
+def test_pev_verify_boxed_without_pass_verdict_triggers_feedback_not_false_pass():
+    """回归测试,对应 2026-10-05 修复的 bug:verifier 正文判 FAIL 但结尾仍习惯性
+    挤出一个 \\boxed{} 时,不能被当成"验证通过"直接收敛,必须按 FAIL 处理触发反馈
+    打回 planner。此前只检查有没有 boxed,导致 600 次真实运行里 fail 永远是 0。
+    """
+    runner = SequencedRunner([
+        [plain("Strategy 1: A\nStrategy 2: B")],  # plan 1
+        [sample("3"), sample("3")],                  # execute 1
+        # verifier 正文判 FAIL,但仍然习惯性给了一个 boxed 答案:不能被当成通过
+        [plain("Candidate 1: FAIL\nOverall: FAIL\n\\boxed{3}")],
+        [plain("Strategy 1: C\nStrategy 2: D")],  # plan 2(应该被触发)
+        [sample("9"), sample("9")],                  # execute 2
+        [verify_pass("9")],                           # verify 2: 真正通过
+    ])
+    config = PEVConfig()
+    next_phase_fn, apply_fn = make_pev_functions(config)
+
+    states = run_agent_loop(
+        runner, [_question()], next_phase_fn=next_phase_fn, apply_fn=apply_fn,
+        max_outer_rounds=(config.max_feedback_rounds + 1) * 3,
+    )
+
+    state = states[0]
+    assert state.final_prediction == "9"  # 没有被 verify 1 的假阳性 boxed 卡住
     assert state.round_idx == 6
 
 
@@ -348,7 +386,7 @@ def test_run_pev_builds_question_record():
     runner = SequencedRunner([
         [plain("Strategy 1: A\nStrategy 2: B", output_tokens=5)],
         [sample("4", output_tokens=15), sample("4", output_tokens=15)],
-        [sample("4", output_tokens=15)],
+        [verify_pass("4", output_tokens=15)],
     ])
 
     result = run_pev(runner, [_question(answer="4")], seed=42)
@@ -420,7 +458,7 @@ def test_thinking_override_reaches_all_roles_and_feedback():
         pev_runner = ThinkingRunner([
             [plain('Strategy 1: A\nStrategy 2: B')], [sample('2'), sample('3')],
             [plain('FAIL')], [plain('Strategy 1: C\nStrategy 2: D')],
-            [sample('2'), sample('2')], [sample('2')],
+            [sample('2'), sample('2')], [verify_pass('2')],
         ])
         result = run_pev(pev_runner, [_question()], seed=41, enable_thinking=thinking)
         assert len(result.records[0].agent_trace) == 8
@@ -431,7 +469,7 @@ def test_pev_five_questions_have_ten_executor_prompts_with_polluted_plans():
     runner = SequencedRunner([
         [plain(planner_text) for _ in range(5)],
         [sample('2') for _ in range(10)],
-        [sample('2') for _ in range(5)],
+        [verify_pass('2') for _ in range(5)],
     ])
     result = run_pev(runner, [_question(question_id=f'q{i}') for i in range(5)], seed=41)
     assert [call['num_prompts'] for call in runner.calls] == [5, 10, 5]

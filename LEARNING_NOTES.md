@@ -1055,3 +1055,110 @@ for a total of at least 36865 tokens.
 **对这个 9B 模型跑 MATH-500,原生 thinking 更接近"大部分场景下的 token 浪费",而不是"必要的推理增强"**:CoT 关闭后不掉分但省 7 成 token;SC 关闭后只掉 0.83pp 但同样省 7 成 token;且收益不集中在难题,反而集中在最简单的 Level 1。对后续 Debate/PEV 的参数选择有直接指导意义:多智能体协作如果也默认开着 thinking,很可能重复同样的"token 消耗远超收益"问题,应该优先考虑关闭(这也是为什么发现 `--disable-thinking` 没接到 `debate`/`pev` 分支是个值得马上修的 bug,见上一条记录)。
 
 ---
+
+## 2026-09-30: PEV/Debate 修复验证完成,但正式跑撞上 GPU 被占——尝试单卡(TP=1)未遂
+
+### 背景
+
+上一条记录里诊断出的 PEV `_parse_strategies` 数量失控 bug,已经委托 Codex 修好并加了单测(`_parse_strategies` 严格按 `expected` 数量提取正式回答、`_bounded_context` 给角色间传递内容加了 6000 字符共享预算防止无限拼接、`enable_thinking` 打通到 `debate`/`pev` 分支)。用真实 GPU 跑了两次 `--limit 5` sanity check 验证:
+
+- **PEV**:三批 prompt 精确是 5→10→5(planner→executor→verifier),跟 `num_strategies=2` 完全对上,不再出现 104 个失控和 `VLLMValidationError`。5 题全部一次通过(`rounds_used=3`,无反馈重试),accuracy=1.0,无截断。
+- **Debate**:5 题 3 个 solver 全部一致直接早停(`rounds_used=1`),accuracy=1.0,无截断,`enable_thinking` 传参改动没有误伤 debate 正常流程。
+
+结论:PEV/Debate 的代码修复已验证生效,可以准备上 200 题正式跑。
+
+### 正式跑之前撞上的新问题:GPU 被占用
+
+准备跑正式实验时发现 GPU 0/1/2 三张卡都被别人的任务占用(`ps` 确认是用户 `jiayu` 的 `EvalAccuracyMetricApp_average_acc_T`,已经跑了 2 天多,每张卡占约 20GB/24.5GB),只有 GPU 3 空闲(14MiB)。这跟 `PROJECT_STATUS.md` 里 09-19 记录的"被 jiayu 占用导致 vLLM 初始化崩溃"是同一个人,不是同一次事件,但性质一样——不能在他的任务还占着的卡上跑 TP=2(默认配置用 GPU 0/1),会重复撞车崩溃。
+
+**排查是否"占着不用"时的一个反转**:第一次看 `nvidia-smi --query-gpu=index,utilization.gpu,...` 时三张卡的 `utilization.gpu` 都是 0%、功耗只有 60-80W(接近待机),同时对应的三个进程 CPU 占用高达 3500%+(各占约 35 核),一度怀疑这是"显存占着不放但 GPU 算力其实空着"的情况。几分钟后再看同一个指标,三张卡变成 79%/69%/95% 利用率、功耗 119-184W,证明只是快照恰好落在它的 CPU 步骤和 GPU 步骤交替之间的空档,不是真的空闲。**教训:判断别人的任务是否在合理使用 GPU,不能只看一次瞬间快照,GPU 利用率本身就是间歇性的(尤其是"生成→评分"这种 CPU/GPU 交替的流水线),要连续采样几次才能下结论,单次 0% 很可能只是采样时机不巧。**
+
+### 尝试:给 `run_experiment.py` 加 `--tensor-parallel-size` 支持单卡跑
+
+`ModelRunner.__init__` 本来就接受 `tensor_parallel_size` 参数,但 `run_experiment.py` 之前没有 CLI 开关暴露出来,硬编码走 `ModelConfig.tensor_parallel_size=2`。加了一个 `--tensor-parallel-size` 参数(不传时行为不变,仍用 `ModelConfig` 默认值),想着如果只有 GPU 3 空闲,能不能用 `CUDA_VISIBLE_DEVICES=3 --tensor-parallel-size 1` 跑,不去碰被占用的 0/1/2。
+
+用 `--limit 5` 先在 GPU 3 上测试单卡是否跑得通,结果启动阶段直接报错:
+
+```
+ValueError: To serve at least one request with the models's max seq len (36864),
+(1.18 GiB KV cache is needed, which is larger than the available KV cache memory (0.3 GiB).
+Based on the available memory, the estimated maximum model length is 7920.
+```
+
+### 根因:单卡显存放不下"权重+KV cache"
+
+Qwen3.5-9B 全部权重(bf16)约 17.8GB(之前 TP=2 跑时每张卡权重占 8.91GB,两张卡加起来就是这个数)。单卡 24.5GB 显存,`gpu_memory_utilization=0.85` 给 vLLM 的预算约 20.9GB,权重占掉 17.8GB 后只剩约 3GB 给其他开销,实际可用的 KV cache 只有 0.3GB——vLLM 自己算出这点 KV cache 撑不住 `max_model_len=36864`,最多只能撑 7920 长度的请求。Debate/PEV 这种多轮累积上下文的方法,单题跑到后面经常会超过 7920(尤其是没关 thinking 的情况),所以单卡方案哪怕启动阶段硬调小 `max_model_len` 绕过这个报错,后续大概率还是会重演"context 超限"的问题,不是一个可靠的绕过方式。
+
+### 教训
+
+1. **9B 模型 + 36864 context 的组合,显存预算基本是"双卡刚好够、单卡明显不够"这条线上**,不是简单降级就能凑合的——遇到"资源被占只剩一张卡"的情况,加 TP=1 的 CLI 支持这个动作本身没错(以后显存更宽松的场景能用上),但不能想着靠它临时应急绕过资源冲突,先算一下"权重体积 vs 单卡可用显存"这个数量级差距值不值得试,而不是先跑起来看报错。
+2. **确认对方进程身份再判断能不能等**:这次先用 `ps -o pid,user,etime,cmd` 查清楚占卡的是 `jiayu` 的什么任务、跑了多久,而不是看到显存被占就直接假设是自己的孤儿进程或者随便挑一张卡硬跑——`nvidia-smi --query-compute-apps` 只给 PID,不给用户名,配合 `ps` 才能查到真实归属,避免误杀别人正常在跑的任务。
+3. 当前状态:代码修复已验证完成,正式跑 200 题的动作被 GPU 资源冲突阻塞,等 GPU 0/1(或 0/1/2 中任意两张)空出来即可按计划执行,不需要再改代码或换机器。
+
+---
+
+## 2026-10-05: Debate/PEV 200 题正式跑批完成,深度分析发现 PEV 的 Verifier 从未真正判过 FAIL——是代码 bug 不是模型行为
+
+### 跑批结果(关闭 thinking,200题×3seed)
+
+| 方法 | 准确率(均值) | avg_total_tokens(均值) | 截断率(均值) |
+|---|---|---|---|
+| Direct | 94.17% | 2,443 | 3.83% |
+| CoT | 94.00% | 2,328 | 2.67% |
+| Self-Consistency | 94.17% | 11,363 | 2.33% |
+| Debate | 94.50% | 7,423 | 1.63% |
+| PEV | 93.17% | 8,778 | 0.17%(但三个seed分别是91.0%/93.5%/95.0%,方差远大于其他方法) |
+
+### Debate 深度分析:早停占 95.83%,真正协作发生时是净正收益
+
+600 道题(3seed×200)里,575 道(95.83%)三个 Solver 第一轮就一致,直接早停,只有 25 道(4.17%)真正进入 critic→refine。这 25 道题 75 个 solver 槏位的修正结果:wrong→right 13 次(17.33%),right→wrong 1 次(1.33%)——`PLAN.md` 里预判的"小模型当critic从众改错"风险确实存在,但发生频率远低于"协作改对",净比例 13:1,是正收益。judge 只触发 8 次,样本太小看不出独立价值。
+
+跟 Self-Consistency 逐题配对比较:562题同对,30题同错,5题SC错Debate对,3题SC对Debate错,**净赢2题**,且只用了SC约65%的token。
+
+**结论:Debate 的优势不是靠复杂协作全程发力,而是"3人投票+早停"几乎零成本复刻了 Self-Consistency 的稳定性,外加一个真正发生时net-positive的纠错环节。**
+
+### PEV 深度分析:核心发现是代码 bug,不是模型行为
+
+用 Codex 写的 `scripts/analyze_collaboration.py` 跑出来一个反直觉的结果:三个 seed 的 `first_pass` 全部是 200/200(100%),`fail` 全部是 0——也就是说"Verifier判FAIL→打回Planner重新规划"这条反馈机制,在600次运行里从未被触发过一次。一开始怀疑是不是模型当 Verifier 时太宽松,从不主动否定候选答案,但读代码(`src/multi_agent/roles.py` 468-472行)后发现是另一个原因:
+
+```python
+verified_answer = _extract(sample)   # 只检查有没有 \boxed{...}
+if verified_answer is not None:
+    _finish(...)   # 有boxed就直接判定"通过"结束,不管正文说了什么
+```
+
+Verifier 的 prompt(`build_verifier_messages`)确实要求模型"如果所有候选都FAIL或无法确定,不要输出boxed",但这完全靠**指令遵循**——代码从来没有真正解析模型在正文里写的 PASS/FAIL 判决词,唯一的判断依据是"输出里有没有 `\boxed{}`"。LLM 有很强的"总要给个答案"倾向,即使正文判断"两个候选都FAIL",也可能习惯性在结尾挤出一个它认为最接近的boxed答案。只要有boxed,代码就认为"验证通过",完全跳过了本该触发的重新规划。
+
+这解释了 `pass_wrong` 指标为什么偏高(seed41=9.00%, seed42=6.50%, seed43=5.00%,跟准确率91%/93.5%/95%完全对应)——PEV 实质上退化成了"2个executor候选 + 一个从不拒绝任何答案的仲裁步骤",仲裁本身在两个候选间选的时候会犯错(right→wrong 6次,wrong→right 18次,net+12,仲裁有点价值但不是靠"验证+重试"拿到的),方差大小直接取决于这次仲裁犯错的多少,不是 Verifier 太严格误杀了对的答案(此前的假设是反的)。
+
+跟 Self-Consistency 逐题配对比较:554题同对,30题同错,5题赢,11题输,**净输6题**。
+
+### 分 Level(1-5)对比五方法
+
+| Method | L1 | L2 | L3 | L4 | L5 |
+|---|---|---|---|---|---|
+| direct | 97.50% | 95.00% | 94.17% | 95.00% | 89.17% |
+| cot | 95.83% | 94.17% | 94.17% | 94.17% | 91.67% |
+| self_consistency | 95.00% | 95.00% | 95.00% | 95.00% | 90.83% |
+| debate | 96.67% | 95.83% | 95.00% | 95.00% | 90.00% |
+| pev | 95.00% | 94.17% | 94.17% | 95.00% | 87.50% |
+
+Debate 的优势集中在 L1-L3,L4-L5(难题)跟基线相当甚至略低,跟之前 thinking 分析"协作收益不集中在难题"的结论一致。PEV 在 L5 是五个方法里最差的(87.50%),说明它那套没有真正发挥作用的"验证"机制,在最需要纠错的难题上反而没帮上忙。
+
+### 教训
+
+1. **"协作机制从未触发"这个异常统计结果,第一反应不该是"模型行为就是这样",而要先去读代码确认统计口径本身有没有问题**——这次差点把"Verifier 100% PASS"直接当成"小模型当verifier时过于宽松"这个行为结论写进报告,实际上是代码只认 `\boxed{}` 存在与否、根本没解析判决文字导致的统计假象。凡是看到"某个分支从未被触发"这种极端统计量,先怀疑统计口径,再怀疑模型行为。
+2. **用"是否存在某个格式标记"代替"是否满足语义条件"是一类常见陷阱**:这里的本意是"验证通过"≈"有boxed答案",但模型的实际行为是"倾向于总是给出boxed",导致这个代理指标和真正想测的语义脱钩。类似教训在之前 PEV 策略解析bug里也出现过(用正则切分 `Strategy N:` 代替真正理解"策略边界"),这次是同一类问题在验证环节的变种。
+3. **这次使用 Codex 分析时遇到后台任务因网络抖动在约20分钟后彻底断连退出(exit code -1)**,但因为它在断连前已经把分析脚本写到磁盘(`scripts/analyze_collaboration.py`),可以直接在本地重跑脚本拿到结果,不需要重新发起 Codex 调用。**教训:让 Codex 写一个可独立重跑的分析脚本,比让它直接在回复里吐出一次性分析结果更抗网络故障**,脚本留在磁盘上,中断了也能自己接着跑。
+
+### 下一步
+
+**需要修复 PEV 的 verifier 判决解析逻辑**(真 bug,不是设计上可以接受的行为),让它真正解析模型给出的 PASS/FAIL 判决,而不是只看有没有 boxed。修复后 Verifier 的拒绝/重试机制会被真正触发,PEV 的行为和当前这批结果会有实质差异,**现有这批 PEV 200题数据在修复后需要重跑**,Debate 的结果不受影响,不用重跑。
+
+**修复已完成,卡在 GPU 验证这一步(2026-10-05 当天)**:
+
+- `src/multi_agent/roles.py`:`build_verifier_messages` 的 prompt 新增明确要求——模型必须在结尾单独一行写 `Overall: PASS` 或 `Overall: FAIL`;新增 `_verifier_passed(text)` 函数,用正则 `overall\s*:\s*(pass|fail)` 解析这一行(取最后一次出现,避免被逐候选的PASS/FAIL叙述干扰),只有"判决是PASS 且确实解析出 `\boxed{}`"两个条件同时满足才算验证通过,否则进入 feedback 分支(或用完预算后兜底投票)。
+- `tests/test_multi_agent.py`:新增 `verify_pass()` test helper(同时带 `Overall: PASS` 和 boxed),更新了 5 个原有测试里"verify阶段通过"的 fixture(原来只给boxed不够了),新增 `test_pev_verify_boxed_without_pass_verdict_triggers_feedback_not_false_pass` 专门覆盖这次修复的bug场景(verifier正文判FAIL但仍然挤出一个boxed,必须被当成FAIL处理,不能被误判通过)。21个单测全部通过。
+- **卡住的地方**:改完代码后想用 `--limit 5` 做一次真实 GPU sanity check,确认真实模型会按要求输出 `Overall: PASS/FAIL`、FAIL分支真的能触发反馈重试,但 GPU 又被 jiayu 占了(这次是1/2/3,只有0空闲,且确认是真的在用算力不是占着不用——`utilization.gpu` 分别是59%/80%/59%这种量级),TP=2跑不起来,TP=1单卡此前已验证过KV cache不够(见上面"尝试单卡"那条记录)。**后续接上这个任务时,先确认GPU 0/1(或任意两张)是否空闲,空闲后按顺序:(1) `--limit 5` sanity check验证修复生效 (2) 重跑PEV 200题正式实验覆盖`results_no_thinking/pev/` (3) 重新跑协作机制分析,看Verifier的拦截/误判比例是否变得有意义、PEV方差是否收窄。**
+
+---

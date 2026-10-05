@@ -53,6 +53,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None, help="只跑前 N 题,用于 sanity check")
     parser.add_argument("--data-path", default=str(PROJECT_ROOT / DATA_PATH))
     parser.add_argument("--results-dir", default=str(PROJECT_ROOT / RESULTS_DIR))
+    parser.add_argument(
+        "--tensor-parallel-size", type=int, default=None,
+        help="覆盖 ModelConfig.tensor_parallel_size(默认 2),单卡可用时传 1",
+    )
     thinking_group = parser.add_mutually_exclusive_group()
     thinking_group.add_argument(
         "--enable-thinking", dest="enable_thinking", action="store_true", default=None,
@@ -75,9 +79,14 @@ def main() -> None:
     seeds = args.seeds if args.seeds else DEFAULT_SEEDS[: args.repeat]
 
     model_config = ModelConfig()
+    tensor_parallel_size = (
+        args.tensor_parallel_size
+        if args.tensor_parallel_size is not None
+        else model_config.tensor_parallel_size
+    )
     runner = ModelRunner(
         model_path=model_config.model_path,
-        tensor_parallel_size=model_config.tensor_parallel_size,
+        tensor_parallel_size=tensor_parallel_size,
         gpu_memory_utilization=model_config.gpu_memory_utilization,
         max_model_len=model_config.max_model_len,
         max_num_seqs=model_config.max_num_seqs,

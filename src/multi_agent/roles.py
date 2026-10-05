@@ -345,6 +345,21 @@ def build_executor_messages(problem: str, strategy: str, max_context_chars: int 
     return [{"role": "user", "content": content}]
 
 
+_VERIFIER_VERDICT_RE = re.compile(r"overall\s*:\s*(pass|fail)", re.IGNORECASE)
+
+
+def _verifier_passed(text: str) -> bool:
+    """只信任 verifier 明确给出的 "Overall: PASS/FAIL" 判决,不能只看有没有
+    \\boxed{}。LLM 有很强的"总要给个答案"倾向,即使正文把所有候选都判成 FAIL,
+    结尾仍可能习惯性挤出一个 boxed 答案;如果只拿 boxed 存在与否当"验证通过"的
+    代理指标,这类假阳性会让反馈重试机制形同虚设(实测 600 次运行里 fail 永远是
+    0,详见 LEARNING_NOTES.md 2026-10-05 记录)。取最后一次出现的 Overall 判决,
+    避免逐候选的 PASS/FAIL 叙述干扰最终结论。
+    """
+    matches = _VERIFIER_VERDICT_RE.findall(text)
+    return bool(matches) and matches[-1].lower() == "pass"
+
+
 def build_verifier_messages(
     problem: str,
     strategies: list[str],
@@ -363,10 +378,11 @@ def build_verifier_messages(
         "or substitute the claimed answer back into the problem - rather than just "
         "re-reading the narrative. For each candidate, state PASS or FAIL with a "
         "brief mechanical justification.\n\n"
-        "If exactly one candidate passes (or multiple pass and agree), end your reply "
-        "with the final answer in \\boxed{}. If all candidates fail or you cannot "
-        "determine a reliable answer, do NOT include \\boxed{} - instead clearly "
-        "explain what went wrong so the strategies can be revised.\n\n"
+        "Then end your reply with a line in exactly this format: 'Overall: PASS' if "
+        "at least one candidate is verified correct, or 'Overall: FAIL' if none are "
+        "reliable. If PASS, follow it with the verified final answer in \\boxed{}. "
+        "If FAIL, do NOT include \\boxed{} - instead clearly explain what went wrong "
+        "so the strategies can be revised.\n\n"
         f"Problem:\n{problem}\n\n{candidates}"
     )
     return [{"role": "user", "content": content}]
@@ -387,10 +403,12 @@ def _parse_strategies(text: str, expected: int) -> list[str]:
 def make_pev_functions(config: PEVConfig, enable_thinking: bool | None = None) -> tuple[NextPhaseFn, ApplyFn]:
     """构造 PEV 流程的 next_phase_fn/apply_fn。
 
-    stage_to_run 在 plan -> execute -> verify 之间循环;verify 阶段解析出
-    \\boxed{} 视为通过并收敛,否则在 feedback_used < config.max_feedback_rounds 时
-    带着 verifier 的反馈打回 planner 重新出策略,用完反馈轮次预算后退化为对当前
-    executor 答案做多数投票兜底,保证一定能收敛。
+    stage_to_run 在 plan -> execute -> verify 之间循环;verify 阶段必须同时满足
+    "verifier 给出 Overall: PASS 判决"和"解析得到 \\boxed{}"才算通过并收敛(见
+    `_verifier_passed`,只看 boxed 存在与否会被模型"总要给个答案"的倾向绕过),
+    否则在 feedback_used < config.max_feedback_rounds 时带着 verifier 的反馈打回
+    planner 重新出策略,用完反馈轮次预算后退化为对当前 executor 答案做多数投票
+    兜底,保证一定能收敛。
     """
 
     def next_phase_fn(state: AgentState) -> list[PhaseStep] | None:
@@ -468,7 +486,7 @@ def make_pev_functions(config: PEVConfig, enable_thinking: bool | None = None) -
         verifier_text = texts[0]
         verified_answer = _extract(sample)
 
-        if verified_answer is not None:
+        if verified_answer is not None and _verifier_passed(verifier_text):
             _finish(state, verified_answer, [verifier_text], [sample.finish_reason])
             return
 
