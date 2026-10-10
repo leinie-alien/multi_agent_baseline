@@ -20,6 +20,6 @@ results_no_thinking/
 *.log
 
 ENV_SETUP_NOTE.md
-PLAN.md
 EXPERIMENT_COMMANDS.md
 PROJECT_STATUS.md
+road.txt
