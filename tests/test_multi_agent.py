@@ -3,13 +3,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.config import DebateConfig, PEVConfig  # noqa: E402
+import pytest
+
+from src.config import MDEConfig, DebateConfig, PEVConfig, RouterConfig  # noqa: E402
 from src.model_runner import PromptResult, SampleResult  # noqa: E402
+from src.multi_agent.mde import run_mde  # noqa: E402
 from src.multi_agent.debate import run_debate  # noqa: E402
 from src.multi_agent.orchestrator import PhaseStep, run_agent_loop  # noqa: E402
 from src.multi_agent.pev import run_pev  # noqa: E402
+from src.multi_agent.router import run_router  # noqa: E402
 from src.multi_agent.roles import (  # noqa: E402
     _parse_strategies,
+    _parse_category,
+    _SPECIALIST_HINTS,
     make_debate_functions,
     make_pev_functions,
 )
@@ -31,7 +37,7 @@ class SequencedRunner:
         return messages[0]["content"]
 
     def generate(self, prompts, temperature, max_tokens, n=1, seed=None, repetition_penalty=1.0):
-        self.calls.append({"temperature": temperature, "num_prompts": len(prompts)})
+        self.calls.append({"temperature": temperature, "num_prompts": len(prompts), "prompts": list(prompts)})
         assert self._batches, "SequencedRunner 的批次已经用完,但调度器又发起了一次 generate"
         batch = self._batches.pop(0)
         assert len(batch) == len(prompts), (
@@ -476,3 +482,242 @@ def test_pev_five_questions_have_ten_executor_prompts_with_polluted_plans():
     for record in result.records:
         assert sum(t['role'].startswith('executor_') for t in record.agent_trace) == 2
         assert record.agent_trace[0]['text'] == planner_text
+
+
+# ---------------------------------------------------------------------------
+# Router: 单路径分类、反馈和 QuestionRecord
+# ---------------------------------------------------------------------------
+
+def test_router_category_matches_known_hint_and_passes_first_try():
+    runner = SequencedRunner([
+        [plain('Category: Geometry')], [sample('2')], [plain('Overall: PASS')],
+    ])
+    question = {**_question(), 'subject': 'SECRET_GROUND_TRUTH'}
+    record = run_router(runner, [question], seed=42).records[0]
+    assert record.prediction == '2' and record.correct
+    assert [t['role'] for t in record.agent_trace] == ['router', 'specialist', 'verifier']
+    assert _SPECIALIST_HINTS['Geometry'] in runner.calls[1]['prompts'][0]
+    assert all('SECRET_GROUND_TRUTH' not in c['prompts'][0] for c in runner.calls)
+    assert [c['temperature'] for c in runner.calls] == [0.3, 0.6, 0.3]
+    assert set(_SPECIALIST_HINTS) == {*RouterConfig().categories, '_fallback'}
+
+
+def test_router_fail_then_retry_then_pass():
+    runner = SequencedRunner([
+        [plain('Category: Geometry')], [sample('3')],
+        [plain('Arithmetic error. Overall: FAIL')], [sample('2')], [plain('Overall: PASS')],
+    ])
+    record = run_router(runner, [_question()], seed=42).records[0]
+    assert record.prediction == '2' and record.correct
+    assert [t['role'] for t in record.agent_trace] == ['router', 'specialist', 'verifier', 'specialist', 'verifier']
+    assert [c['num_prompts'] for c in runner.calls] == [1] * 5
+    retry = runner.calls[3]['prompts'][0]
+    assert 'Your original solution' in retry and sample('3').text in retry
+    assert 'Arithmetic error. Overall: FAIL' in retry
+    assert _SPECIALIST_HINTS['Geometry'] in retry
+    assert "Specialist's solution" in runner.calls[4]['prompts'][0]
+
+
+def test_router_budget_exhausted_falls_back_to_specialist_answer():
+    runner = SequencedRunner([
+        [plain('Category: Algebra')], [sample('3')], [plain('Overall: FAIL')],
+        [sample('5', finish_reason='length')], [plain('Overall: FAIL')],
+    ])
+    record = run_router(runner, [_question()], seed=42, config=RouterConfig(max_feedback_rounds=1)).records[0]
+    assert record.prediction == '5'
+    assert record.rounds_used == 5
+    assert record.raw_outputs == [sample('5').text]
+    assert record.finish_reasons == ['length']
+
+
+def test_parse_category_handles_malformed_output():
+    assert _parse_category('I choose Geometry.', RouterConfig().categories) is None
+
+
+def test_parse_category_handles_hallucinated_unknown_category():
+    assert _parse_category('Category: Trigonometry', RouterConfig().categories) is None
+
+
+def test_router_verify_pass_without_extractable_specialist_answer_does_not_false_finish():
+    runner = SequencedRunner([
+        [plain('Category: Algebra')], [plain('Unable to solve this.')], [verify_pass('999')],
+        [sample('2')], [plain('Overall: PASS')],
+    ])
+    record = run_router(runner, [_question()], seed=42).records[0]
+    assert record.prediction == '2'
+    assert record.rounds_used == 5 and len(runner.calls) == 5
+    runner = SequencedRunner([
+        [plain('Category: Algebra')], [plain('Unable to solve this.')], [verify_pass('999')],
+    ])
+    record = run_router(runner, [_question()], seed=42, config=RouterConfig(max_feedback_rounds=0)).records[0]
+    assert record.prediction is None and not record.correct
+
+
+def test_router_max_feedback_rounds_zero_never_retries():
+    runner = SequencedRunner([
+        [plain('Category: Algebra')], [sample('3')], [plain('Overall: FAIL')],
+    ])
+    record = run_router(runner, [_question()], seed=42, config=RouterConfig(max_feedback_rounds=0)).records[0]
+    assert len(runner.calls) == 3
+    assert record.prediction == '3' and record.rounds_used == 3
+
+
+def test_router_max_outer_rounds_formula_generalizes_to_k2():
+    runner = SequencedRunner([
+        [plain('Category: Algebra')], [sample('3')], [plain('Overall: FAIL')],
+        [sample('4')], [plain('Overall: FAIL')], [sample('2')], [plain('Overall: PASS')],
+    ])
+    record = run_router(runner, [_question()], seed=42, config=RouterConfig(max_feedback_rounds=2)).records[0]
+    assert record.prediction == '2' and record.correct
+    assert record.rounds_used == 7 and len(runner.calls) == 7
+    assert [t['role'] for t in record.agent_trace] == ['router'] + ['specialist', 'verifier'] * 3
+
+
+def test_thinking_override_reaches_router_roles():
+    class ThinkingRunner(SequencedRunner):
+        def build_prompt(self, messages, enable_thinking=None):
+            assert enable_thinking is thinking
+            return super().build_prompt(messages, enable_thinking)
+
+    for thinking in (None, False, True):
+        runner = ThinkingRunner([
+            [plain('Category: Algebra')], [sample('3')], [plain('Overall: FAIL')],
+            [sample('2')], [plain('Overall: PASS')],
+        ])
+        record = run_router(runner, [_question()], seed=42, enable_thinking=thinking).records[0]
+        assert len(record.agent_trace) == 5
+
+
+def test_run_router_builds_question_record():
+    runner = SequencedRunner([
+        [plain('Category: Algebra', output_tokens=5)], [sample('2', output_tokens=15)],
+        [plain('Overall: PASS', output_tokens=8)],
+    ])
+    result = run_router(runner, [_question()], seed=42)
+    record = result.records[0]
+    assert result.method == record.method == 'router'
+    assert result.seed == 42
+    assert record.question_id == 'q1' and record.level == 5
+    assert record.ground_truth == record.prediction == '2' and record.correct
+    assert record.input_tokens == 30 and record.output_tokens == 28 and record.total_tokens == 58
+    assert record.rounds_used == 3 and len(record.agent_trace) == 3
+    assert [t['role'] for t in record.agent_trace] == ['router', 'specialist', 'verifier']
+    assert record.raw_outputs == [sample('2').text] and record.finish_reasons == ['stop']
+
+
+def test_parse_category_ignores_thinking_and_accepts_case_and_trailing_lines():
+    categories = RouterConfig().categories
+    assert _parse_category('<think>Category: Algebra</think>\nCategory: geometry  \nExtra text', categories) == 'Geometry'
+    assert _parse_category('Category: Algebra</think>\nCategory: NUMBER THEORY', categories) == 'Number Theory'
+    assert _parse_category('<think>Category: Algebra', categories) is None
+    assert _parse_category('Category:\nGeometry', categories) is None
+
+
+def test_router_unknown_category_uses_fallback_hint():
+    runner = SequencedRunner([
+        [plain('Category: Trigonometry')], [sample('2')], [verify_pass('999')],
+    ])
+    record = run_router(runner, [_question()], seed=42).records[0]
+    assert record.prediction == '2'
+    assert _SPECIALIST_HINTS['_fallback'] in runner.calls[1]['prompts'][0]
+
+
+# ---------------------------------------------------------------------------
+# MDE: 方法隔离、全一致早停与仲裁归因
+# ---------------------------------------------------------------------------
+
+def test_mde_early_stop_when_solvers_agree():
+    runner = SequencedRunner([[sample('2'), sample('2'), sample('2')]])
+    record = run_mde(runner, [_question()], seed=42).records[0]
+    assert record.prediction == '2' and record.correct
+    assert record.rounds_used == 1 and len(runner.calls) == 1
+    assert [t['role'] for t in record.agent_trace] == ['solver_0', 'solver_1', 'solver_2']
+
+
+def test_mde_partial_disagreement_still_goes_to_reconciler():
+    runner = SequencedRunner([
+        [sample('2'), sample('2'), sample('3')], [sample('3')],
+    ])
+    record = run_mde(runner, [_question()], seed=42).records[0]
+    assert record.prediction == '3'
+    assert record.rounds_used == 2 and len(runner.calls) == 2
+    assert [t['role'] for t in record.agent_trace] == ['solver_0', 'solver_1', 'solver_2', 'reconciler']
+
+
+def test_mde_reconciler_resolves_disagreement():
+    solvers = [sample('2'), sample('3'), sample('4')]
+    reconciler = sample('7', finish_reason='length')
+    runner = SequencedRunner([solvers, [reconciler]])
+    record = run_mde(runner, [_question(answer='7')], seed=42).records[0]
+    assert record.prediction == '7' and record.correct
+    assert record.raw_outputs == [reconciler.text]
+    assert record.finish_reasons == ['length']
+    prompt = runner.calls[1]['prompts'][0]
+    for i, (name, _) in enumerate(MDEConfig().method_hints):
+        assert f'--- Solver {i + 1} ({name}) solution ---\n{solvers[i].text}' in prompt
+    assert 'independently re-derive at least one' in prompt
+    assert 'instead of just trusting the majority' in prompt
+
+
+def test_mde_reconciler_parse_failure_falls_back_to_solver_majority_vote():
+    solvers = [sample('2', finish_reason='length'), sample('2'), sample('3')]
+    failed = plain('Unable to reconcile these solutions.')
+    runner = SequencedRunner([solvers, [failed]])
+    record = run_mde(runner, [_question()], seed=42).records[0]
+    assert record.prediction == '2' and record.correct
+    assert record.raw_outputs == [s.text for s in solvers]
+    assert record.finish_reasons == ['length', 'stop', 'stop']
+    assert record.agent_trace[-1]['text'] == failed.text
+    assert failed.text not in record.raw_outputs
+
+
+def test_mde_each_solver_receives_correct_and_only_its_own_method_hint():
+    config = MDEConfig()
+    runner = SequencedRunner([[sample('2'), sample('2'), sample('2')]])
+    run_mde(runner, [_question()], seed=42, config=config)
+    assert runner.calls[0]['temperature'] == 0.3
+    for i, (name, hint) in enumerate(config.method_hints):
+        prompt = runner.calls[0]['prompts'][i]
+        assert hint in prompt and f'Method: {name}' in prompt
+        assert f'method only: {name}' in prompt
+        for other_name, other_hint in config.method_hints:
+            if other_name != name:
+                assert other_name not in prompt and other_hint not in prompt
+
+
+def test_mde_config_rejects_fewer_than_two_method_hints():
+    for hints in ([], [('A', 'a')]):
+        with pytest.raises(ValueError, match='至少需要 2 个方法'):
+            MDEConfig(method_hints=hints)
+    assert len(MDEConfig(method_hints=[('A', 'a'), ('B', 'b')]).method_hints) == 2
+
+
+def test_thinking_override_reaches_mde_solver_and_reconciler_roles():
+    class ThinkingRunner(SequencedRunner):
+        def build_prompt(self, messages, enable_thinking=None):
+            assert enable_thinking is thinking
+            return super().build_prompt(messages, enable_thinking)
+
+    for thinking in (None, False, True):
+        runner = ThinkingRunner([
+            [sample('2'), sample('3'), sample('4')], [sample('2')],
+        ])
+        record = run_mde(runner, [_question()], seed=42, enable_thinking=thinking).records[0]
+        assert [t['role'] for t in record.agent_trace] == ['solver_0', 'solver_1', 'solver_2', 'reconciler']
+
+
+def test_run_mde_builds_question_record():
+    runner = SequencedRunner([
+        [sample('2', output_tokens=20), sample('3', output_tokens=20), sample('4', output_tokens=20)],
+        [sample('2', output_tokens=15)],
+    ])
+    result = run_mde(runner, [_question()], seed=42)
+    record = result.records[0]
+    assert result.method == record.method == 'mde' and result.seed == 42
+    assert record.question_id == 'q1' and record.level == 5
+    assert record.ground_truth == record.prediction == '2' and record.correct
+    assert record.input_tokens == 40 and record.output_tokens == 75 and record.total_tokens == 115
+    assert record.rounds_used == 2
+    assert [t['role'] for t in record.agent_trace] == ['solver_0', 'solver_1', 'solver_2', 'reconciler']
+    assert record.raw_outputs == [sample('2').text] and record.finish_reasons == ['stop']
+    assert [c['temperature'] for c in runner.calls] == [0.3, 0.3]

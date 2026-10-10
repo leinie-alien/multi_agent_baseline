@@ -1162,3 +1162,138 @@ Debate 的优势集中在 L1-L3,L4-L5(难题)跟基线相当甚至略低,跟之�
 - **卡住的地方**:改完代码后想用 `--limit 5` 做一次真实 GPU sanity check,确认真实模型会按要求输出 `Overall: PASS/FAIL`、FAIL分支真的能触发反馈重试,但 GPU 又被 jiayu 占了(这次是1/2/3,只有0空闲,且确认是真的在用算力不是占着不用——`utilization.gpu` 分别是59%/80%/59%这种量级),TP=2跑不起来,TP=1单卡此前已验证过KV cache不够(见上面"尝试单卡"那条记录)。**后续接上这个任务时,先确认GPU 0/1(或任意两张)是否空闲,空闲后按顺序:(1) `--limit 5` sanity check验证修复生效 (2) 重跑PEV 200题正式实验覆盖`results_no_thinking/pev/` (3) 重新跑协作机制分析,看Verifier的拦截/误判比例是否变得有意义、PEV方差是否收窄。**
 
 ---
+
+## 2026-10-09: PEV Verifier 修复验证完成——重跑200题,方差收窄62%,协作机制真实效果浮现
+
+### 验证过程
+
+GPU 空出后(0/1/2/3全部空闲),按上一条记录的计划顺序执行:
+
+1. **`--limit 5` sanity check**:先跑5题默认子集(全对),又专门挑了5道Level 5难题重跑一次(也全对,但这5题恰好两个executor候选都做对了,没能观测到真实FAIL路径)。检查`agent_trace`里verifier的原文,确认真实模型稳定遵循了新prompt的要求,10道题(两次sanity check共)里verifier都在结尾准确输出了`Overall: PASS`这一行,格式没有跑偏。虽然这次没撞上FAIL的真实样例,但解析逻辑本身已有单测覆盖FAIL场景,加上PASS场景在真实模型上验证一致,足以确认修复生效,随即推进到200题正式重跑。
+2. **归档旧数据**:把修复前的bug数据从 `results_no_thinking/pev/` 移到 `results_no_thinking/pev_PRE_VERIFIER_FIX_BUGGY/`,不是直接覆盖删除,保留下来方便做修复前后对比。
+3. **重跑200题×3seed**:全程在tmux session里跑,过程中seed42/43都出现了真实的"verifier判FAIL→打回planner重新规划→新策略再执行→再验证"的完整反馈循环(此前这条路径600次运行从未走过一次)。其中一次反馈重试里某道Level5难题的executor阶段单个候选耗时115秒/条,被误判为"进度卡死",后用`nvidia-smi`确认GPU仍在100%满载计算、worker进程CPU时间持续增长,排除卡死,纯粹是难题推理链长导致。
+
+### 修复前后完整对比
+
+| | 修复前(bug) | 修复后 |
+|---|---|---|
+| 各seed准确率 | 91.0% / 93.5% / 95.0% | 93.0% / 94.5% / 94.0% |
+| 均值 | 93.17% | 93.83%(+0.67pp) |
+| **标准差** | **2.02pp** | **0.76pp(-62%)** |
+| avg_total_tokens | ~8,778 | ~10,109(+15%) |
+| Verifier判FAIL次数(600次运行) | **0** | **21** |
+| 触发反馈重试的题目占比 | 0% | 2.33%(14/600) |
+| 与Self-Consistency配对净输题数 | 净输6题 | 净输2题 |
+
+### 教训
+
+1. **"机制真正工作"和"机制工作得划算"是两件独立的事,前者成立不代表后者也成立**。这次修复让Verifier从"从不拒绝"变成"真的会拦截21次候选并触发重新规划",方差显著收窄(标准差降62%),这是机制真正工作的证据;但分难度看,PEV在Level5(最难)的准确率(89.17%)反而是五个方法里最低的,且该难度的token消耗(23,770)仅次于Self-Consistency——反馈重试在难题上被更频繁触发,花了更多计算,却没能转化成更高的难题准确率。不能因为"bug修复后指标变好了"就停止深挖,机制生效后仍然要继续看它在哪些场景下划算、哪些场景下不划算。
+2. **判断一个长时间无进度变化的后台任务是否卡死,不能只看日志/进度条,要交叉验证GPU利用率和进程CPU时间**。这次反馈重试里有个candidate耗时115秒远超正常水平,仅看tmux里"进度条卡在同一行没动"容易误判为卡死,实际是`nvidia-smi`显示两张卡仍100%利用率、`ps`里worker进程累计CPU时间仍在增长,证明是真实计算而非挂死。这类判断尽量用两个独立信号互相印证,不要只信一个。
+3. **归档旧数据而不是直接覆盖删除,这次确实派上了用场**——修复前后的完整对比表(标准差从2.02pp降到0.76pp)直接写进了`FINAL_REPORT.md`第7.2节,成为"这次修复真的有效"的核心证据之一,如果当时直接覆盖了`results_no_thinking/pev/`,就没有这组对比数据可用。
+4. 当前状态:`FINAL_REPORT.md` 第4/6/7.2/8/9节的PEV相关TODO已全部用真实数据填上,报告已基本完整,仅剩第1节模型版本号信息待补,以及第9节是否要补第三个协作架构(拓展方案C)作为可选项,视时间精力决定。
+
+---
+
+## 2026-10-09: 新增第三个多智能体架构 Router(拓展D,workflow范式)——200题跑批验证"上游决策影响下游行为"是真实机制
+
+### 背景
+
+用户的学姐指出多智能体协作有两大范式:"discussion"(多角色讨论同一问题互相验证)和"workflow"(拆成子任务,各角色专注自己的子任务)。现有 Debate(discussion)和 PEV(更接近功能分工但靠多候选集成)都偏discussion,`PLAN.md`里早就规划好但没做的"拓展D"(Router→Domain Specialist→轻量Verifier)正是workflow范式的落地,用户同意实现("加吧,时间并没有什么限制")。
+
+### 设计过程:先让Plan agent审查,再委托Codex实现
+
+设计方案没有直接写代码,先用一个独立的审查agent(非实现agent)过了一遍初稿,发现并修正了6个关键问题,其中最重要的两条:
+
+1. **收敛条件必须是双重条件**:`specialist_answer is not None and _verifier_passed(verifier_text)`,不能只看verifier判决——这是直接复用PEV那次bug的教训,如果只看判决文字,还是会被"模型总要给个PASS"的假阳性绕过。
+2. **类别名必须用数据集`subject`字段的原始英文字符串**(Algebra/Geometry等),不能用中文归类名,否则分析脚本算"路由准确率"时要做模糊映射,这个映射表本身就是新的出错点。
+
+审查也确认了一个设计顾虑:"只有一条候选链,没有多角色互证,会不会显得单薄"——结论是不会,因为Discussion/Workflow和"单候选/多候选"是两条独立的坐标轴,workflow的判定标准是"上游决策是否真的在运行时改变下游角色的行为"(控制流依赖),Router的Specialist用哪条学科提示是由Router的分类结果动态决定的,这比PEV的固定三段式流水线更符合workflow的本质特征。
+
+修正后的方案(双重收敛条件、重试只打回specialize不跳回route、`max_outer_rounds=1+2*(k+1)`的自解释写法、`_PASS_FAIL_VERDICT_INSTRUCTION`共享常量、`_parse_category`区分畸形格式/幻觉类别两种失败)写成完整的实现任务,委托给Codex。Codex完成后新增/改动:`src/config.py`的`RouterConfig`、`src/multi_agent/roles.py`新增router相关函数、新建`src/multi_agent/router.py`、`scripts/run_experiment.py`注册、`tests/test_multi_agent.py`新增12个测试(比预期的10个多了2个额外的边界测试)、`scripts/analyze_collaboration.py`扩展支持router分析。
+
+### 自己审查代码(不只信Codex的自述)
+
+逐一核实了审查时定下的关键点都被正确实现:双重收敛条件、`_parse_category`正确区分"格式畸形(没有Category:前缀)"和"幻觉类别(格式对但不在7个白名单里,比如模型编造'Trigonometry')"两种失败路径都返回None、重试确实只打回"specialize"不会跳回"route"(用`test_router_fail_then_retry_then_pass`验证了5步顺序)。还发现一个加分细节:测试里专门验证了Router的prompt不会泄露ground truth的`subject`字段(给question dict塞了个`SECRET_GROUND_TRUTH`标记,断言所有prompt都不包含它)——这是设计方案没有明确要求但完全符合"必须纯粹从problem文本分类"要求的测试,说明Codex理解了这个约束的重要性。自己跑了一遍`uv run pytest`,33个测试(21原有+12新增)全部通过,不是只听Codex报告。
+
+### GPU验证:sanity check先发现一个有意思的早期信号
+
+`--limit 5`分层sanity check跑完后,检查发现5题里4题分类"错"(跟数据集真实subject字段对不上),但最终答案全部正确。这不是bug——技术层面确认了Router输出格式完全合规(分类字符串都落在7个原生subject名范围内),`agent_trace`结构正确,没有崩溃。这个现象提示"分类错误的容错性可能不低",但n=5太小不能下结论,留给200题正式跑批验证。
+
+### 200题×3seed正式跑批结果
+
+| | 准确率 | avg_total_tokens | 标准差 |
+|---|---:|---:|---:|
+| Router | 94.17% | 4,970 | 0.29pp(六个方法里最低,与SC并列) |
+
+**跟Direct(94.17%,2443)/CoT(94.00%,2328)/Self-Consistency(94.17%,11363)/Debate(94.50%,7423)/PEV(93.83%,10109)对比**:Router的准确率跟Direct/SC持平、只比Debate低0.33pp,但token消耗只有Debate的67%、PEV的49%、SC的44%,方差六个方法里最低。
+
+**路由分类准确率46.67%(280/600)**——跟sanity check的印象一致,确实不高。但**分类正确(95.36%)vs分类错误(93.12%)时的最终准确率只差2.24pp**,量化验证了sanity check阶段的早期信号:workflow范式"上游决策影响下游行为"这个机制是真实生效的(2.24pp不是噪音),但影响幅度有限,不是"一步错步步错"——因为Specialist仍然做完整的step-by-step求解,错误的学科提示只是"稍微带偏方向"。
+
+按subject分层发现Geometry(83.33%)和Intermediate Algebra(88.89%,且token消耗10,000.5全场最高)是Router的明显弱项,这跟分Level表里Level 5的token消耗骤增(11,185.2,接近4倍于L4)吻合——Level 5里Intermediate Algebra占比最高(13/40题)。
+
+### 教训
+
+1. **让一个独立agent专门审查设计方案,比自己审查自己的草稿更容易发现"看起来合理但有隐藏假设"的问题**——这次最关键的两处修正(双重收敛条件、类别名用原生英文字符串)都是设计阶段没有写清楚、审查后才明确下来的,如果没有这一步直接去实现,大概率会在真实跑批后才发现(类似PEV当年那次bug是跑了200题之后才发现的)。
+2. **"听起来可能单薄"的设计疑虑,要用信息流结构去分析,不能靠直觉**。"只有一条候选链会不会显得单薄"这个疑虑,拆解成"discussion/workflow"和"单候选/多候选"两条独立坐标轴后,结论是不单薄——这类分析应该在写代码前做完,不要等实现完了再担心。
+3. **"分类准不准"不是workflow范式的评价标准,"分类决策是否真的改变了下游结果"才是**。Router的路由准确率只有46.67%,如果只看这一个数字容易得出"这个架构设计失败了"的错误结论,但真正要看的是分类对错两种情况下游结果的差距(2.24pp)——这个数字证明了机制本身在生效,路由准确率低只是说明分类任务本身比较模糊(题目常同时涉及多个数学工具),不是架构缺陷。
+4. 当前状态:三个真多智能体协作架构(Debate/PEV/Router)全部完成200题×3seed正式跑批,`FINAL_REPORT.md`已更新至包含三者的完整对比和各自的协作机制深度分析,仅剩第1节模型版本号信息待补,`PLAN.md`拓展C(Method-Diversity Ensemble)作为可选的第四个架构,视时间精力决定是否再做。
+
+---
+
+## 待处理技术债:Debate 的 Judge fallback 分支存在归因脱节问题(发现于 2026-10-09 审查 MDE 设计方案时,尚未修复)
+
+在设计第四个架构(MDE)时请审查agent顺带检查了 Debate 现有代码,发现 `roles.py` 里 Judge 阶段的 fallback 逻辑有个"存证"问题:当 Judge 自己的输出解析不出 `\boxed{}` 答案时,代码退化成对 `refined_answers`(Refine阶段3个Solver修正后的答案)做多数投票,这个决策逻辑本身没问题,但调用 `_finish()` 时传入的 `raw_outputs`/`finish_reasons` 用的是 **Judge 自己那段解析失败的文本**,不是真正产生投票结果的 `refined_texts`。
+
+对比 Debate 另一处类似的 fallback(critic-only 边界情况,`roles.py` 254-260行)处理方式是一致的:投票答案来自 solver,`_finish` 存的也是 `solver_texts`(产生投票答案的那批原始文本)——这才是正确的归因方式。Judge fallback 没有照这个做。
+
+**影响范围**:只在"进入了Judge阶段 且 Judge自己解析失败"的双重条件下触发。根据已有分析数据,Judge阶段600题里只触发了8次,这8次里又只有解析失败的才会踩到这个问题,实际受影响样本数很小,**不影响已经写进 FINAL_REPORT.md 的准确率/token等核心数字**(因为`prediction`字段本身是对的,只是`raw_outputs`/`agent_trace`的可追溯性有问题)。只影响"回头想从trace倒查某道题的推理过程"这类debug场景。
+
+**暂不修复的原因**:Debate的200题数据已经跑完定稿,这个问题不影响已报告的结果,优先级低于推进新架构。MDE设计时已经把这个教训吸收进去(Reconciler解析失败时的fallback要存Solver的原始文本,不是Reconciler自己的失败文本)。
+
+**待办**:如果以后有空档,考虑修复这处 `_finish` 调用,传入 `state.scratch["refined_texts"]` 和对应 finish_reasons,而不是当前 `apply_fn` 里 judge 分支的 `texts`。这是个独立的小修复,不需要重跑Debate的200题(除非要重新验证`raw_outputs`字段本身,但`prediction`/`correct`/token统计都不受影响)。
+
+---
+
+## 2026-10-09/10: 新增第四个多智能体架构 MDE(拓展C,方法多样性ensemble)——验证"强制方法多样性"比"temperature采样多样性"制造更多真实分歧
+
+### 背景
+
+`PLAN.md`里规划了"拓展C:Method-Diversity Ensemble + Reconciler",跟Debate的核心区别是多样性来源:Debate的3个Solver用同一种解法靠temperature(0.7)采样碰运气制造分歧;MDE的3个Solver被**强制**分配三种不同方法(Algebraic/Geometric/Numerical),多样性是设计出来的,不靠采样。用户决定在Router(拓展D)完成后接着做这个。
+
+### 设计审查:发现Debate现有代码一个真实的归因脱节bug
+
+跟Router一样,先让一个独立的Plan agent审查设计方案再委托Codex实现。这次审查除了对MDE方案本身提出6点修正,还顺带读了Debate现有代码,**发现了一个此前完全没被注意到的真实bug**:Debate的Judge阶段fallback逻辑(`roles.py` 278-282行附近)——当Judge自己解析不出boxed答案时,退化成对`refined_answers`做多数投票,这个决策本身没问题,但`_finish()`调用传入的`raw_outputs`/`finish_reasons`用的是**Judge自己那段解析失败的文本**,不是真正产生投票结果的`refined_texts`。这导致以后想从`agent_trace`倒查"这个答案是哪段推理给出的"会查到一段无关文本。影响范围很小(600题里Judge只触发8次,其中只有解析失败的才踩坑),不影响已报告的准确率数字,记录为技术债,暂不修复(见上一条记录)。
+
+这次审查还确认了MDE设计里的6个关键修正点:
+1. `method_hints`用`(方法名,方法描述)`元组列表,不是整句字符串(方便`build_reconciler_messages`标注方法名)。
+2. `solver_temperature`用0.3而不是更高的值——理由是要让"方法多样性vs采样多样性谁更能制造真实分歧"这个对比干净,必须把采样噪声压到最低,跟Debate的0.7温度形成对照组意义。
+3. `MDEConfig.__post_init__`校验`method_hints`至少2个,否则`_all_agree`对单元素列表恒为True,会导致Reconciler永远不会被触发(单方法退化成永远早停的隐藏坑)。
+4. **Reconciler解析失败的fallback,必须用solver原始文本做归因,不能用reconciler自己的失败文本**——这是直接吸收上面发现的Debate bug的教训,照抄Debate另一处正确的precedent(critic-only fallback)。
+5. `build_reconciler_messages`要加防从众措辞(照抄Debate critic的"Verify the reasoning yourself instead of just trusting the majority")。
+6. `build_method_solver_messages`要用强制性措辞,并要求模型以"Method: {name}"开头自报,作为后续分析的弱交叉信号。
+
+### 自己审查代码(不只信Codex的自述)
+
+逐一核实了6个修正点全部正确实现,尤其是第4点——读代码确认`reconcile`阶段`apply_fn`里,`answer is None`时用的是`state.scratch["solver_texts"]`和`state.scratch["solver_finish_reasons"]`,不是reconciler自己的`texts`,注释也写清楚了"投票结果必须能追溯到solver原文,不能归因到解析失败的仲裁文本"。自己跑了`uv run pytest`,41个测试(33原有+8新增)全部通过,重点看了两个关键测试的断言内容:`test_mde_partial_disagreement_still_goes_to_reconciler`验证"2/3一致仍要进入reconciler,没有被偷懒加个多数捷径";`test_mde_reconciler_parse_failure_falls_back_to_solver_majority_vote`里有个很扎实的反向断言`assert failed.text not in record.raw_outputs`,直接证明没有重演Debate那个bug。
+
+### GPU验证:sanity check检查了完整推导内容,不只是自报标签
+
+`--limit 5`sanity check跑完后,除了确认格式合规(每个solver都正确自报了`Method: Algebraic/Geometric/Numerical`),还专门检查了完整推导内容——验证模型是否真的用了被分配的方法,而不是嘴上说一套、推导里偷偷换回自己习惯的方法("假多样性"风险,这是审查agent最担心的点)。实际检查发现方法遵循度扎实:比如同一道"距离=速度×时间"的题,Geometric solver真的把它转化成了坐标系里的矩形面积问题,不是简单套个标签。5题全部一次早停,没有触发Reconciler(样本太小,正常现象)。
+
+### 200题×3seed正式跑批结果
+
+| | 准确率 | avg_total_tokens | 标准差 |
+|---|---:|---:|---:|
+| MDE | 94.33%(94.0%/94.5%/94.5%) | 6,613 | 0.29pp(与Router并列最低) |
+
+**核心发现——solve阶段分歧率:MDE 8.50%(51/600) vs Debate 4.17%(25/600),约2倍**。这个结果在MDE温度更低(0.3 vs Debate的0.7,更不容易因采样随机性产生分歧)的条件下测出来,证据力更强:**强制指定不同方法确实比靠temperature采样制造出更多真实分歧**,验证了MDE设计的核心假设。
+
+但Reconciler介入后的仲裁效果不如Debate:51道reconcile题目里,"solver多数票→最终答案"的改对改错比例是**4:4(net neutral)**,对比Debate的13:1(明显净正收益),MDE虽然制造了更多分歧场景,却没能把这些场景转化为净收益。另外发现Reconciler很少真正独立推导出新答案——96.08%(49/51)的情况下最终答案等于某个solver的原始答案,只有3.92%(2/51)给出了跟三者都不同的全新答案,提示Reconciler更多是在"几个已有候选里选择相信谁",不是经常推导出第四种答案(但文本相同不能直接证明"没有独立判断",只是弱信号)。
+
+### 教训
+
+1. **"审查设计方案"这个步骤的价值不止于审查当前任务,还能顺带发现跟当前任务无关、但同样重要的既有问题**——这次审查MDE时顺带发现了Debate现有代码的归因脱节bug,如果没有专门请审查agent带着"MDE要避免重演什么问题"的视角去读Debate代码,这个bug可能会一直潜伏下去。以后设计新功能时,如果新功能跟已有代码结构相似,审查范围应该主动扩展到"检查已有代码里类似模式是否也有同样的坑",不要只审查新代码本身。
+2. **制造更多分歧(协作触发更频繁)不等于更好地解决分歧(协作效果更好)**——这是继PEV(机制生效≠机制划算)、Router(分类决策影响下游≠决定架构整体价值)之后,第三次在不同架构里验证"协作效果的某个维度表现好"不能直接推出"整体协作质量好"这个一般性原则。MDE的分歧制造能力(8.50% vs 4.17%)是本次四个架构里最强的,但分歧解决能力(1:1)是最弱的——这两件事需要分开评估,不能因为分歧率高就假设协作一定更有效。
+3. 当前状态:四个真多智能体协作架构(Debate/PEV/Router/MDE)全部完成200题×3seed正式跑批,`FINAL_REPORT.md`已更新至包含四者的完整对比和各自的协作机制深度分析(第7.1-7.4节)。仅剩第1节模型版本号信息待补。
+
+---

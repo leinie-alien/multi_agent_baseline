@@ -1,6 +1,8 @@
 """实验统一入口。
 
 用法示例:
+    python scripts/run_experiment.py --method mde --limit 5
+    python scripts/run_experiment.py --method router --limit 5
     python scripts/run_experiment.py --method direct --limit 5          # sanity check
     python scripts/run_experiment.py --method cot --repeat 3
     python scripts/run_experiment.py --method self_consistency --repeat 3
@@ -31,6 +33,8 @@ from src.methods.self_consistency import run_self_consistency  # noqa: E402
 from src.model_runner import ModelRunner  # noqa: E402
 from src.multi_agent.debate import run_debate  # noqa: E402
 from src.multi_agent.pev import run_pev  # noqa: E402
+from src.multi_agent.router import run_router  # noqa: E402
+from src.multi_agent.mde import run_mde  # noqa: E402
 from src.results_io import save_run_result  # noqa: E402
 
 METHOD_RUNNERS = {
@@ -39,10 +43,12 @@ METHOD_RUNNERS = {
     "self_consistency": run_self_consistency,
     "debate": run_debate,
     "pev": run_pev,
+    "router": run_router,
+    "mde": run_mde,
 }
 
 # 多智能体的输出预算由角色内部控制,因此与基线入口分开调用。
-MULTI_AGENT_METHODS = {"debate", "pev"}
+MULTI_AGENT_METHODS = {"debate", "pev", "router", "mde"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,11 +66,11 @@ def parse_args() -> argparse.Namespace:
     thinking_group = parser.add_mutually_exclusive_group()
     thinking_group.add_argument(
         "--enable-thinking", dest="enable_thinking", action="store_true", default=None,
-        help="强制开启思考(对 cot/self_consistency/debate/pev 有效,direct 始终关闭)",
+        help="强制开启思考(对 cot/self_consistency/debate/pev/router/mde 有效,direct 始终关闭)",
     )
     thinking_group.add_argument(
         "--disable-thinking", dest="enable_thinking", action="store_false",
-        help="强制关闭思考(对 cot/self_consistency/debate/pev 有效,direct 始终关闭)",
+        help="强制关闭思考(对 cot/self_consistency/debate/pev/router/mde 有效,direct 始终关闭)",
     )
     return parser.parse_args()
 

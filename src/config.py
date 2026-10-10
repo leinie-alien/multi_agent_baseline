@@ -73,6 +73,62 @@ class PEVConfig:
     repetition_penalty: float = 1.05
     max_context_chars: int = 6000  # 角色间共享字符预算,避免长输出累积撑满上下文
 
+
+@dataclass
+class RouterConfig:
+    """Router-Specialist-Verifier(拓展 D,`PLAN.md` 里的 workflow 范式)的分类类别/
+    反馈轮次上限/采样参数。
+
+    categories 必须和 data/math500_200.json 里 subject 字段的原始英文字符串逐字一致
+    (不能用中文归类名),否则 scripts/analyze_collaboration.py 计算"路由分类准确率"
+    时需要额外的映射表来对齐两套词表,这个映射表本身就是新的出错点。
+
+    跟 PEV 的结构性区别:只有一条 Specialist 候选链,不是多候选集成,所以 Verifier
+    判通过后直接用 Specialist 已给出的答案收尾,不像 PEV 的 Verifier 要在多个候选里
+    重新选一个、重新报一次 boxed。重试只打回 Specialist(route 阶段只执行一次,不参与
+    重试循环),这跟 PEV 的重试打回 Planner(route 阶段也要重复)不同,体现 Router 比
+    PEV 更轻量的定位。max_feedback_rounds 默认比 PEVConfig 的 2 更小。
+    """
+    categories: list[str] = field(default_factory=lambda: [
+        "Algebra", "Intermediate Algebra", "Prealgebra", "Precalculus",
+        "Number Theory", "Counting & Probability", "Geometry",
+    ])
+    max_feedback_rounds: int = 1
+    router_temperature: float = 0.3
+    specialist_temperature: float = 0.6
+    verifier_temperature: float = 0.3
+    repetition_penalty: float = 1.05
+    max_context_chars: int = 6000
+
+
+@dataclass
+class MDEConfig:
+    """Method-Diversity Ensemble + Reconciler(拓展C):多样性来自强制指定的解题
+    方法本身,不靠temperature采样。跟Debate的核心区别是多样性来源:Debate是同一种
+    解法+随机采样碰运气制造分歧,MDE是设计出来的方法差异。
+
+    solver_temperature 用 0.3(跟 PEV executor 一致,不跟 Debate solver 的 0.7
+    对齐):MDE 的核心论点是"分歧主要来自方法差异",如果温度定得偏高,观察到分歧率
+    升高就无法排除"只是温度采样的功劳"这个混淆变量,必须把采样噪声压到最低才能让
+    "方法多样性 vs 采样多样性谁更能制造真实分歧"这个分析命题干净可信。
+    """
+    method_hints: list[tuple[str, str]] = field(default_factory=lambda: [
+        ("Algebraic", "set up equations/variables and solve symbolically."),
+        ("Geometric", "use diagrams, coordinates, symmetry, or visual relationships."),
+        ("Numerical", "substitute specific values, test patterns, or approximate numerically."),
+    ])
+    solver_temperature: float = 0.3
+    reconciler_temperature: float = 0.3
+    repetition_penalty: float = 1.05
+    max_context_chars: int = 6000
+
+    def __post_init__(self) -> None:
+        if len(self.method_hints) < 2:
+            raise ValueError(
+                "MDEConfig.method_hints 至少需要 2 个方法,否则 _all_agree 对单元素"
+                "列表恒为True,会导致 Reconciler 永远不会被触发"
+            )
+
 # 每种方法重复运行的次数与对应 seed(seed 与重复次数一一对应,不同 repeat 用不同 seed
 # 以产生真实的采样波动,同时保证结果可复现)。
 DEFAULT_SEEDS: list[int] = [41, 42, 43]

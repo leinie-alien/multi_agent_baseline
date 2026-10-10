@@ -1,11 +1,11 @@
-"""Debate 与 PEV 两套多智能体流程的角色 prompt 构造 + next_phase_fn/apply_fn 状态机。
+"""Debate、PEV、Router 与 MDE 四套多智能体流程的角色 prompt 构造 + next_phase_fn/apply_fn 状态机。
 
-两套流程共用 orchestrator.run_agent_loop,区别只在这里:各自的 prompt 怎么组、
+四套流程共用 orchestrator.run_agent_loop,区别只在这里:各自的 prompt 怎么组、
 下一步该发什么、什么时候算收敛/该早停/该打回上一角色重来,全部通过
 next_phase_fn/apply_fn 两个闭包下放给调度器——调度器本身不理解 "solver"/
 "planner" 这些角色语义,只负责按采样参数分组 batch 调用。
 
-两套流程都遵循同一个"当前这一步是什么阶段"的记录约定:next_phase_fn 决定这一步
+四套流程都遵循同一个"当前这一步是什么阶段"的记录约定:next_phase_fn 决定这一步
 发什么之后,把阶段名写进 state.scratch,供 apply_fn 处理这一步返回结果时读取;
 apply_fn 处理完之后再把"下一步该进入哪个阶段"写回 state.scratch,供下一次
 next_phase_fn 调用读取。
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 
-from ..config import DebateConfig, FINAL_ANSWER_INSTRUCTION, ModelConfig, PEVConfig
+from ..config import DebateConfig, FINAL_ANSWER_INSTRUCTION, MDEConfig, ModelConfig, PEVConfig, RouterConfig
 from ..extract_answer import extract_answer, is_equiv
 from ..methods.self_consistency import majority_vote
 from .orchestrator import AgentState, ApplyFn, NextPhaseFn, PhaseStep
@@ -345,6 +345,13 @@ def build_executor_messages(problem: str, strategy: str, max_context_chars: int 
     return [{"role": "user", "content": content}]
 
 
+# PEV 和 Router 共用判决格式;修改时两边 prompt 与解析逻辑都要检查,避免不一致。
+_PASS_FAIL_VERDICT_INSTRUCTION = (
+    "End your reply with a line in exactly this format: 'Overall: PASS' or "
+    "'Overall: FAIL'."
+)
+
+
 _VERIFIER_VERDICT_RE = re.compile(r"overall\s*:\s*(pass|fail)", re.IGNORECASE)
 
 
@@ -378,8 +385,9 @@ def build_verifier_messages(
         "or substitute the claimed answer back into the problem - rather than just "
         "re-reading the narrative. For each candidate, state PASS or FAIL with a "
         "brief mechanical justification.\n\n"
-        "Then end your reply with a line in exactly this format: 'Overall: PASS' if "
-        "at least one candidate is verified correct, or 'Overall: FAIL' if none are "
+        # PEV 和 Router 共用判决格式;修改时也检查 Light Verifier 与判决解析逻辑。
+        f"{_PASS_FAIL_VERDICT_INSTRUCTION} "
+        "Use PASS if at least one candidate is verified correct, or FAIL if none are "
         "reliable. If PASS, follow it with the verified final answer in \\boxed{}. "
         "If FAIL, do NOT include \\boxed{} - instead clearly explain what went wrong "
         "so the strategies can be revised.\n\n"
@@ -503,5 +511,253 @@ def make_pev_functions(config: PEVConfig, enable_thinking: bool | None = None) -
                 state.scratch["executor_texts"],
                 state.scratch["executor_finish_reasons"],
             )
+
+    return next_phase_fn, apply_fn
+
+
+# ---------------------------------------------------------------------------
+# Router: Router -> Domain Specialist -> Light Verifier (workflow 范式,拓展D)
+# ---------------------------------------------------------------------------
+
+_SPECIALIST_HINTS: dict[str, str] = {
+    "Algebra": "Consider equations, substitution, factoring, and algebraic identities.",
+    "Intermediate Algebra": "Consider polynomial structure, inequalities, complex numbers, and careful domain restrictions.",
+    "Prealgebra": "Consider arithmetic, fractions, ratios, percentages, and unit conversions.",
+    "Precalculus": "Consider function identities, trigonometry, logarithms, and transformations of graphs.",
+    "Number Theory": "Consider modular arithmetic, divisibility, and prime factorization.",
+    "Counting & Probability": "Consider systematic counting, complementary events, and avoiding double counting.",
+    "Geometry": "Consider similar triangles, the Pythagorean theorem, angle and area relations, or coordinates.",
+    "_fallback": "Identify the relevant mathematical tools, break the problem into steps, and check all assumptions.",
+}
+
+_ROUTER_CATEGORY_RE = re.compile(r"^[ \t]*Category:[ \t]*([^\r\n]+)", re.IGNORECASE | re.MULTILINE)
+
+
+def build_router_messages(problem: str, categories: list[str]) -> list[dict]:
+    content = (
+        "Classify the problem solely from its text. Do not assume a subject; base "
+        "your classification on the mathematical tools actually required by the problem.\n"
+        "Choose exactly one of these categories (use its exact spelling):\n"
+        + "\n".join(categories)
+        + f"\n\nProblem:\n{problem}\n\n"
+        "Output only one line, exactly in this format: Category: <one category name>"
+    )
+    return [{"role": "user", "content": content}]
+
+
+def _parse_category(text: str, categories: list[str]) -> str | None:
+    match = _ROUTER_CATEGORY_RE.search(_formal_answer(text))
+    if match is None:
+        return None
+    category = match.group(1).strip().casefold()
+    return next((name for name in categories if name.casefold() == category), None)
+
+
+def build_specialist_messages(problem: str, hint: str) -> list[dict]:
+    content = (
+        "You are a domain specialist solving a math problem.\n"
+        f"Methodological hint: {hint}\n"
+        "Work through it step by step and show your reasoning clearly.\n\n"
+        f"Problem:\n{problem}"
+        f"{FINAL_ANSWER_INSTRUCTION}"
+    )
+    return [{"role": "user", "content": content}]
+
+
+def build_specialist_retry_messages(
+    problem: str, hint: str, own_text: str, verifier_feedback: str,
+    max_context_chars: int = 6000,
+) -> list[dict]:
+    own_text, verifier_feedback = _bounded_context([own_text, verifier_feedback], max_context_chars)
+    content = (
+        "You previously solved the math problem below. Reconsider your solution "
+        "using the verifier's feedback. Fix genuine errors, but retain correct "
+        "reasoning if the objection does not hold up. Give a revised solution step by step.\n"
+        f"Methodological hint: {hint}\n\n"
+        f"Problem:\n{problem}\n\n"
+        f"--- Your original solution ---\n{own_text}\n\n"
+        f"--- Verifier's feedback ---\n{verifier_feedback}"
+        f"{FINAL_ANSWER_INSTRUCTION}"
+    )
+    return [{"role": "user", "content": content}]
+
+
+def build_light_verifier_messages(
+    problem: str, specialist_text: str, max_context_chars: int = 6000,
+) -> list[dict]:
+    specialist_text, = _bounded_context([specialist_text], max_context_chars)
+    content = (
+        "Verify this solution mechanically: redo the key computations or substitute "
+        "the claimed answer back into the problem; do not just re-read the narrative. "
+        "Judge whether the answer already given is correct. You do not need to "
+        "provide the final answer again; do NOT output a boxed answer. "
+        "If FAIL, briefly explain the errors so the specialist can revise the solution.\n\n"
+        f"Problem:\n{problem}\n\n"
+        f"--- Specialist's solution ---\n{specialist_text}\n\n"
+        # PEV 和 Router 共用判决格式;修改时也检查 PEV prompt 与判决解析逻辑。
+        f"{_PASS_FAIL_VERDICT_INSTRUCTION}"
+    )
+    return [{"role": "user", "content": content}]
+
+
+def make_router_functions(config: RouterConfig, enable_thinking: bool | None = None) -> tuple[NextPhaseFn, ApplyFn]:
+    """单路径验证必须同时有答案和 PASS;重试保持原分类,只打回 Specialist。"""
+    def next_phase_fn(state: AgentState) -> list[PhaseStep] | None:
+        stage = state.scratch.get("stage_to_run", "route")
+        state.scratch["current_stage"] = stage
+        problem = state.question["problem"]
+        if stage == "route":
+            role = "router"
+            messages = build_router_messages(problem, config.categories)
+            temperature = config.router_temperature
+        elif stage == "specialize":
+            role = "specialist"
+            hint = _SPECIALIST_HINTS.get(state.scratch.get("category"), _SPECIALIST_HINTS["_fallback"])
+            feedback = state.scratch.get("verifier_feedback")
+            if feedback is None:
+                messages = build_specialist_messages(problem, hint)
+            else:
+                messages = build_specialist_retry_messages(
+                    problem, hint, state.scratch["specialist_text"], feedback, config.max_context_chars,
+                )
+            temperature = config.specialist_temperature
+        else:
+            role = "verifier"
+            messages = build_light_verifier_messages(
+                problem, state.scratch["specialist_text"], config.max_context_chars,
+            )
+            temperature = config.verifier_temperature
+        return [PhaseStep(
+            role=role, messages=messages, temperature=temperature,
+            max_tokens=_MAX_TOKENS, repetition_penalty=config.repetition_penalty,
+            enable_thinking=enable_thinking,
+        )]
+
+    def apply_fn(state: AgentState, steps: list[PhaseStep], outputs) -> None:
+        stage = state.scratch["current_stage"]
+        texts = _record_trace(state, steps, outputs)
+        if stage == "route":
+            state.scratch["category"] = _parse_category(texts[0], config.categories)
+            state.scratch["stage_to_run"] = "specialize"
+            return
+        if stage == "specialize":
+            state.scratch["specialist_text"] = texts[0]
+            state.scratch["specialist_answer"] = _extract(outputs[0].samples[0])
+            state.scratch["specialist_finish_reason"] = outputs[0].samples[0].finish_reason
+            state.scratch["stage_to_run"] = "verify"
+            return
+
+        specialist_answer = state.scratch.get("specialist_answer")
+        verifier_text = texts[0]
+        if specialist_answer is not None and _verifier_passed(verifier_text):
+            _finish(state, specialist_answer, [state.scratch["specialist_text"]],
+                    [state.scratch["specialist_finish_reason"]])
+            return
+        feedback_used = state.scratch.get("feedback_used", 0)
+        if feedback_used < config.max_feedback_rounds:
+            state.scratch["feedback_used"] = feedback_used + 1
+            state.scratch["verifier_feedback"] = verifier_text
+            state.scratch["stage_to_run"] = "specialize"
+        else:
+            # 单链没有投票依据,保留最后一次 Specialist 输出及其真实结束原因。
+            _finish(state, specialist_answer, [state.scratch["specialist_text"]],
+                    [state.scratch["specialist_finish_reason"]])
+
+    return next_phase_fn, apply_fn
+
+
+# ---------------------------------------------------------------------------
+# MDE: Method-Diversity Ensemble + Reconciler (拓展C,多样性来自方法而非采样)
+# ---------------------------------------------------------------------------
+
+def build_method_solver_messages(problem: str, method_name: str, method_hint: str) -> list[dict]:
+    content = (
+        f"You must solve this problem using the following method only: {method_name}.\n"
+        f"{method_hint}\n"
+        "Do not switch to a different class of technique even if another approach "
+        "seems easier or more natural - push the assigned method as far as it goes.\n"
+        f'Begin your solution with the line "Method: {method_name}".\n\n'
+        f"Problem:\n{problem}"
+        f"{FINAL_ANSWER_INSTRUCTION}"
+    )
+    return [{"role": "user", "content": content}]
+
+
+def build_reconciler_messages(
+    problem: str, solver_texts: list[str], method_names: list[str],
+    max_context_chars: int = 6000,
+) -> list[dict]:
+    solver_texts = _bounded_context(solver_texts, max_context_chars)
+    solutions = "\n\n".join(
+        f"--- Solver {i + 1} ({name}) solution ---\n{text}"
+        for i, (name, text) in enumerate(zip(method_names, solver_texts))
+    )
+    content = (
+        "Reconcile the solutions obtained using different methods below. Check whether "
+        "the methods converge on the same answer and identify concrete errors. "
+        "When the answers disagree, you must independently re-derive at least one "
+        "of the disagreeing methods before giving your final answer. Show this "
+        "independent derivation and explain how it resolves the disagreement. "
+        "Verify the reasoning yourself instead of just trusting the majority; "
+        "do not choose an answer solely because more solvers support it.\n\n"
+        f"Problem:\n{problem}\n\n{solutions}"
+        f"{FINAL_ANSWER_INSTRUCTION}"
+    )
+    return [{"role": "user", "content": content}]
+
+
+def make_mde_functions(config: MDEConfig, enable_thinking: bool | None = None) -> tuple[NextPhaseFn, ApplyFn]:
+    def next_phase_fn(state: AgentState) -> list[PhaseStep] | None:
+        stage = state.scratch.get("stage_to_run", "solve")
+        state.scratch["current_stage"] = stage
+        problem = state.question["problem"]
+        if stage == "solve":
+            return [
+                PhaseStep(
+                    role=f"solver_{i}",
+                    messages=build_method_solver_messages(problem, name, hint),
+                    temperature=config.solver_temperature,
+                    max_tokens=_MAX_TOKENS,
+                    repetition_penalty=config.repetition_penalty,
+                    enable_thinking=enable_thinking,
+                )
+                for i, (name, hint) in enumerate(config.method_hints)
+            ]
+        return [
+            PhaseStep(
+                role="reconciler",
+                messages=build_reconciler_messages(
+                    problem, state.scratch["solver_texts"],
+                    [name for name, _ in config.method_hints], config.max_context_chars,
+                ),
+                temperature=config.reconciler_temperature,
+                max_tokens=_MAX_TOKENS,
+                repetition_penalty=config.repetition_penalty,
+                enable_thinking=enable_thinking,
+            )
+        ]
+
+    def apply_fn(state: AgentState, steps: list[PhaseStep], outputs) -> None:
+        stage = state.scratch["current_stage"]
+        texts = _record_trace(state, steps, outputs)
+        finish_reasons = [out.samples[0].finish_reason for out in outputs]
+        if stage == "solve":
+            answers = [_extract(out.samples[0]) for out in outputs]
+            state.scratch["solver_texts"] = texts
+            state.scratch["solver_answers"] = answers
+            state.scratch["solver_finish_reasons"] = finish_reasons
+            if _all_agree(answers):
+                _finish(state, answers[0], texts, finish_reasons)
+            else:
+                state.scratch["stage_to_run"] = "reconcile"
+            return
+
+        answer = _extract(outputs[0].samples[0])
+        if answer is not None:
+            _finish(state, answer, texts, finish_reasons)
+        else:
+            # 投票结果必须能追溯到 solver 原文,不能归因到解析失败的仲裁文本。
+            winner, _ = majority_vote(state.scratch["solver_answers"])
+            _finish(state, winner, state.scratch["solver_texts"], state.scratch["solver_finish_reasons"])
 
     return next_phase_fn, apply_fn

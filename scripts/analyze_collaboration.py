@@ -17,11 +17,20 @@ import sys
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from src.config import RouterConfig
+from src.multi_agent.roles import _all_agree, _parse_category
 from src.extract_answer import extract_answer, is_equiv, last_boxed_only_string
 from src.methods.self_consistency import majority_vote
 
-METHODS = ('direct', 'cot', 'self_consistency', 'debate', 'pev')
+METHODS = ('direct', 'cot', 'self_consistency', 'debate', 'pev', 'router', 'mde')
 SEEDS = (41, 42, 43)
+
+# subject 仅用于离线评估,不进入 Router 推理输入。
+SUBJECT_LOOKUP = {
+    q['question_id']: q['subject']
+    for q in json.loads((ROOT / 'data' / 'math500_200.json').read_text())
+}
+assert len(SUBJECT_LOOKUP) == 200
 
 # Human reading of FINAL candidate verdicts in these frozen traces, not keyword
 # counting (FAIL often occurs in quoted instructions or abandoned calculations).
@@ -177,6 +186,66 @@ def pev(rows, details=False):
         print('Initial vote rescued:', json.dumps(fixes, ensure_ascii=False))
 
 
+def router(rows, subject_lookup):
+    categories = RouterConfig().categories
+    groups = {True: [], False: []}
+    retries = Counter()
+    for r in rows:
+        trace = r['agent_trace']
+        routed = next(t for t in trace if t['role'] == 'router')
+        predicted = _parse_category(routed['text'], categories)
+        groups[predicted == subject_lookup[r['question_id']]].append(r)
+        retries[sum(t['role'] == 'specialist' for t in trace) - 1] += 1
+    print('routing accuracy:', rate(len(groups[True]), len(rows)))
+    for matched, subset in groups.items():
+        print('final accuracy with routing ' + ('correct:' if matched else 'incorrect:'),
+              rate(sum(r['correct'] for r in subset), len(subset)))
+    print('feedback retry rate:', rate(sum(n for k, n in retries.items() if k > 0), len(rows)))
+    print('retries:', {k: rate(n, len(rows)) for k, n in sorted(retries.items())})
+    print('| Subject | Accuracy | Mean total tokens |')
+    print('|---|---:|---:|')
+    for subject in categories:
+        subset = [r for r in rows if subject_lookup[r['question_id']] == subject]
+        accuracy = rate(sum(r['correct'] for r in subset), len(subset))
+        tokens = f"{mean(r['total_tokens'] for r in subset):,.1f}" if subset else 'N/A'
+        print(f'| {subject} | {accuracy} | {tokens} |')
+
+
+def mde(rows):
+    counts = Counter()
+    changes = Counter()
+    for r in rows:
+        solvers = [t for t in r['agent_trace'] if t['role'].startswith('solver_')]
+        reconciler = [t for t in r['agent_trace'] if t['role'] == 'reconciler']
+        assert len(solvers) >= 2
+        answers = [answer(t) for t in solvers]
+        if _all_agree(answers):
+            assert not reconciler and r['rounds_used'] == 1
+            counts['early'] += 1
+        else:
+            assert len(reconciler) == 1 and r['rounds_used'] == 2
+            counts['reconcile'] += 1
+            initial, _ = majority_vote(answers)
+            changes[transition(is_equiv(initial, r['ground_truth']), r['correct'])] += 1
+            raw = answer(reconciler[0])
+            assert r['prediction'] == (raw if raw is not None else initial)
+            counts['fallback'] += raw is None
+            # 文本相同只是答案来源的弱信号,不能据此证明是否独立推导。
+            if raw is not None:
+                counts['matches_solver' if raw in answers else 'different_from_all'] += 1
+    print('solve all-agree / early stop:', rate(counts['early'], len(rows)))
+    print('disagreement:', rate(counts['reconcile'], len(rows)))
+    print('initial solver majority vote -> final (reconciled questions):')
+    for before in (False, True):
+        for after in (False, True):
+            key = transition(before, after)
+            print(key, rate(changes[key], counts['reconcile']))
+    print('reconciler parse failure / solver vote fallback:', rate(counts['fallback'], counts['reconcile']))
+    parsed = counts['reconcile'] - counts['fallback']
+    print('reconciler answer matches a solver (text comparison):', rate(counts['matches_solver'], parsed))
+    print('reconciler answer differs from all solvers (text comparison):', rate(counts['different_from_all'], parsed))
+
+
 def semantic_audit(rows):
     digest = hashlib.sha256()
     for r in rows:
@@ -230,7 +299,7 @@ def main():
                 assert r['total_tokens'] == r['input_tokens'] + r['output_tokens']
                 r['seed'] = seed
             runs[method, seed] = rows
-    print('Validated 15 runs: same 200 questions, levels and ground truths; summaries and final scores match.')
+    print(f'Validated {len(runs)} runs: same 200 questions, levels and ground truths; summaries and final scores match.')
     print('Correctness uses existing is_equiv (not a symbolic mathematical equivalence oracle).')
     print('PEV PASS = extracted verifier answer exists; FAIL = no extractable answer.')
     print('A candidate-level FAIL in prose is not a feedback retry.')
@@ -242,6 +311,10 @@ def main():
         print('\nPEV', seed)
         rows = [r for s in SEEDS if seed == 'all' or s == seed for r in runs['pev', s]]
         pev(rows, args.details and seed != 'all')
+    print('\nROUTER')
+    router([r for s in SEEDS for r in runs['router', s]], SUBJECT_LOOKUP)
+    print('\nMDE')
+    mde([r for s in SEEDS for r in runs['mde', s]])
     semantic_audit([r for s in SEEDS for r in runs['pev', s]])
     print('\nLEVEL sizes per seed:', dict(sorted(Counter(r['level'] for r in runs['direct', 41]).items())))
     for metric in ('correct', 'total_tokens'):
@@ -254,7 +327,7 @@ def main():
             cells = [f'{100*x:.2f}%' if metric == 'correct' else f'{x:,.1f}' for x in vals]
             print('| ' + ' | '.join([method, *cells]) + ' |')
     print('\nPaired comparison vs self_consistency (same seed and question):')
-    for method in ('debate', 'pev'):
+    for method in ('debate', 'pev', 'router', 'mde'):
         pairs = Counter()
         for seed in SEEDS:
             sc = {r['question_id']: r for r in runs['self_consistency', seed]}
