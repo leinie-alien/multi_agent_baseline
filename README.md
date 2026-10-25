@@ -1,25 +1,44 @@
-# Multi-Agent Baseline: Direct vs CoT vs Self-Consistency on MATH-500
+# Multi-Agent Baseline: 单智能体基线 + 四种多智能体协作架构 on MATH-500
 
-对比 Direct Answer / Chain-of-Thought / Self-Consistency 三种推理方法在 MATH-500(200题,5个难度各40题)上的准确率与 Token 成本。详细设计见 `PLAN.md`。
+在 MATH-500(200题,5个难度各40题)上对比七种推理方法的准确率与 Token 成本:三个单智能体基线(Direct / CoT / Self-Consistency)+ 四个真多智能体协作架构(Debate / PEV / Router / MDE)。详细设计见 `PLAN.md`,完整结果与深度分析见 `FINAL_REPORT.md`,实现与调试过程见 `LEARNING_NOTES.md`。
 
-## 三种方法是什么
+## 方法总览
+
+### 三个单智能体基线
 
 - **Direct(直接作答)**:把题目丢给模型,让它直接说答案,不要求解题过程。类似问别人"3的平方是多少",对方脱口而出"9",没有过程。最省 token、跑得最快,但复杂题容易因为没有"逐步思考"的机会而直接算错,通常准确率最低。
 
 - **CoT(思维链,Chain-of-Thought)**:要求模型把解题步骤写出来,一步一步推,最后再给答案。相当于给模型的推理搭了脚手架,减少跳步出错。通常比 Direct 准确率高,但输出变长,token 消耗明显增加。
 
-- **Self-Consistency(自我一致性 / 多数投票)**:让模型对同一道题独立"想"很多遍(本项目 N=5,每次带一点随机性,所以 5 次的解法/答案可能不完全一样),再看这 5 次里哪个答案出现次数最多,采信那个。类似 5 个人分别独立做同一道题,少数服从多数——如果模型走对了推理路径,大概率稳定得到同一个答案,走偏了的错误路径反而五花八门、彼此不一致,所以"最常出现的答案"更可能是对的。通常三者中准确率最高,但要跑 5 次完整 CoT,token 成本约是单次 CoT 的 5 倍。
+- **Self-Consistency(自我一致性 / 多数投票)**:让模型对同一道题独立"想"很多遍(本项目 N=5,每次带一点随机性,所以 5 次的解法/答案可能不完全一样),再看这 5 次里哪个答案出现次数最多,采信那个。类似 5 个人分别独立做同一道题,少数服从多数。通常三个基线里准确率最高,但要跑 5 次完整 CoT,token 成本约是单次 CoT 的 5 倍。本质是"同模型多次独立采样投票",不构成角色分工意义上的多智能体协作。
 
 三者是层层递进的实验设计:Direct 是最省钱的基线,CoT 用更多 token 换更高准确率,Self-Consistency 再用更多 token 换更进一步的准确率提升。实验最终要回答的问题就是:每一步"加钱"到底值不值——多花的 token,换来的准确率提升有多少。
+
+### 四个真多智能体协作架构
+
+要求角色之间存在真实分工与信息交互(明确排除"同模型多次独立采样投票"这类伪协作),以及 Self-Refine(单模型自我修正循环,排除依据见 `PLAN.md`)。
+
+- **Debate**(discussion 范式):Proposer(3 个 Solver)各自独立解题 → Critic 看到所有解法指出分歧与错误 → Solver 参考批评 Refine → Judge 给出最终答案。第一轮全体一致时直接早停。
+
+- **PEV**(Planner-Executor-Verifier,多候选集成):Planner 出候选策略 → Executor 按策略求解 → Verifier 做机械复核判 PASS/FAIL,FAIL 可打回 Planner 重新规划(最多2次反馈)。
+
+- **Router**(workflow 范式):Router 先判断题目所属学科 → 对应的 Domain Specialist 用该学科提示作答 → Light Verifier 只对已有答案判 PASS/FAIL(不重新作答),FAIL 可打回 Specialist 重试(最多1次反馈)。全程单路径流水线,不依赖多候选集成。
+
+- **MDE**(Method-Diversity Ensemble,方法多样性 ensemble):3 个 Solver 被强制分配三种不同解题方法(Algebraic / Geometric / Numerical),不一致则 Reconciler 仲裁。多样性来源是强制指定的方法而非 temperature 采样(`solver_temperature` 刻意压低到 0.3)。
+
+四者的范式区分、分析方法与完整结果见 `FINAL_REPORT.md` 第 3、7 节。
 
 ## 目录结构
 
 ```
-data/            题目 ID 列表 + 准备好的数据集
-src/             核心代码(模型接口、prompt、答案提取、三种方法)
-scripts/         数据准备 / 运行实验 / 汇总结果 的入口脚本
-results/         每次运行的逐题结果与汇总
-tests/           不依赖 GPU 的单元测试(答案提取与等价判断)
+data/                       题目 ID 列表 + 准备好的数据集
+src/
+  methods/                   Direct / CoT / Self-Consistency
+  multi_agent/               Debate / PEV / Router / MDE 及角色 prompt、通用调度器
+  config.py                  模型配置 + 各方法的协作参数(DebateConfig/PEVConfig/RouterConfig/MDEConfig)
+scripts/                     数据准备 / 运行实验 / sanity check / 汇总 / 协作机制分析
+results/、results_no_thinking/   每次运行的逐题结果与汇总(分别对应开启/关闭原生 thinking)
+tests/                       不依赖 GPU 的单元测试(答案提取、方法公共逻辑、多智能体角色与调度逻辑)
 ```
 
 ## 使用步骤
@@ -30,33 +49,46 @@ tests/           不依赖 GPU 的单元测试(答案提取与等价判断)
    ```
 2. Sanity check(先用少量题目验证 pipeline,需要 vLLM + GPU 环境):
    ```bash
-   python scripts/run_experiment.py --method direct --limit 5 --repeat 1
-   python scripts/run_experiment.py --method cot --limit 5 --repeat 1
-   python scripts/run_experiment.py --method self_consistency --limit 5 --repeat 1
+   # 三个基线:分层抽样(每难度1题,共5题)
+   python scripts/run_sanity_check.py --disable-thinking
+
+   # 协作架构:--limit 5 配独立 results-dir,避免跟正式结果混
+   python scripts/run_experiment.py --method mde --limit 5 --seeds 41 \
+       --disable-thinking --results-dir results/sanity_check
    ```
-3. 确认无误后跑完整实验(每种方法默认重复 3 次,seed 见 `src/config.py`):
+3. 确认无误后跑完整实验(每种方法默认重复 3 次,seed 见 `src/config.py` 的 `DEFAULT_SEEDS`):
    ```bash
-   python scripts/run_experiment.py --method direct
-   python scripts/run_experiment.py --method cot
-   python scripts/run_experiment.py --method self_consistency
+   python scripts/run_experiment.py --method direct --disable-thinking
+   python scripts/run_experiment.py --method cot --disable-thinking
+   python scripts/run_experiment.py --method self_consistency --disable-thinking
+   python scripts/run_experiment.py --method debate --disable-thinking
+   python scripts/run_experiment.py --method pev --disable-thinking
+   python scripts/run_experiment.py --method router --disable-thinking
+   python scripts/run_experiment.py --method mde --disable-thinking
    ```
 4. 汇总结果:
    ```bash
    python scripts/aggregate_results.py
    ```
    生成 `results/summary_overall.md`(方法整体对比)和 `results/summary_by_level.md`(按难度分层)。
+5. 协作机制深度分析(早停率、分歧率、仲裁转移矩阵、路由分类准确率等):
+   ```bash
+   python scripts/analyze_collaboration.py
+   ```
 
 ## 关键设计
 
-- 三种方法共用同一个 `ModelRunner`(`src/model_runner.py`),同一 tokenizer、同一 `max_tokens`,只有 prompt 和采样参数不同,保证公平对比。
-- Direct / CoT 使用 temperature=0.6,Self-Consistency 使用 temperature=0.7、N=5,这样"重复3次取均值"对三种方法都有统计意义。
-- 答案提取与等价判断(`src/extract_answer.py`)参考 Hendrycks MATH 官方评测逻辑,处理 `\boxed{}`、分数、小数、百分号、单位等情况。
+- 所有方法共用同一个 `ModelRunner`(`src/model_runner.py`),同一 tokenizer、同一 `max_tokens`,只有 prompt 和采样参数不同,保证公平对比。
+- Direct / CoT 使用 temperature=0.6,Self-Consistency 使用 temperature=0.7、N=5;Debate 的 solver_temperature=0.7,MDE 刻意压低到 0.3 以排除采样随机性对"方法多样性制造分歧"这一结论的混淆。
+- 答案提取与等价判断(`src/extract_answer.py`)参考 Hendrycks MATH 官方评测逻辑,处理 `\boxed{}`、分数、小数、百分号、单位等情况;被截断(`finish_reason == "length"`)的输出禁用兜底提取,诚实返回 `None`。
 - Self-Consistency 的 token 统计按 N 次独立调用的口径计入输入 token(`input_tokens * n`),不会低估成本。
+- 四个协作架构复用同一个通用多轮调度器(`src/multi_agent/orchestrator.py`):每轮把当前题目一次性 batch 调用模型,按结果决定早停或进入下一阶段,角色 prompt 构造与收敛判断逻辑在 `src/multi_agent/roles.py` 里按方法区分。
+- 默认关闭模型原生 thinking(`--disable-thinking`):对照实验显示 thinking 在本设置下更接近 token 浪费而非必要的推理增强,详见 `FINAL_REPORT.md` 第5节。
 
 ## 测试
 
 ```bash
-python -m pytest tests/
+pytest tests/
 ```
 
-`src/model_runner.py` 依赖 vLLM,只能在服务器 GPU 环境下运行,本机测试只覆盖答案提取逻辑。
+`src/model_runner.py` 依赖 vLLM,只能在服务器 GPU 环境下运行,本机测试覆盖答案提取逻辑、方法公共流程,以及四个协作架构的角色解析/收敛条件/fallback 归因逻辑(共64个单测)。

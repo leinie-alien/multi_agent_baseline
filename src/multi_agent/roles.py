@@ -277,9 +277,12 @@ def make_debate_functions(config: DebateConfig, enable_thinking: bool | None = N
 
         # phase == "judge"
         judge_answer = _extract(outputs[0].samples[0])
-        if judge_answer is None:
-            judge_answer, _ = majority_vote(state.scratch["refined_answers"])
-        _finish(state, judge_answer, texts, finish_reasons)
+        if judge_answer is not None:
+            _finish(state, judge_answer, texts, finish_reasons)
+        else:
+            winner, _ = majority_vote(state.scratch["refined_answers"])
+            _finish(state, winner, state.scratch["refined_texts"],
+                     [None] * len(state.scratch["refined_texts"]))
 
     return next_phase_fn, apply_fn
 
