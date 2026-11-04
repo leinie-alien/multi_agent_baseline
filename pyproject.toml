@@ -1,7 +1,7 @@
 [project]
 name = "multi-agent-baseline"
 version = "0.1.0"
-description = "Direct vs CoT vs Self-Consistency on MATH-500"
+description = "Direct/CoT/Self-Consistency baselines vs Debate/PEV/Router/MDE multi-agent collaboration on MATH-500"
 requires-python = "==3.10.*"
 dependencies = [
     "vllm==0.19.1",
