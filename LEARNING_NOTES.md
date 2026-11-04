@@ -1004,9 +1004,9 @@ for a total of at least 36865 tokens.
 
 第二批 104 个 prompt 是第一个异常信号:`--limit 5` 题、`PEVConfig.num_strategies=2`,executor 阶段正常应该是 5×2=10 个 prompt,104 个明显不对。
 
-### 根因(委托 Codex 定位,只读排查未改代码)
+### 根因(只读排查,未改代码)
 
-1. **`src/multi_agent/roles.py` 的 `_parse_strategies(text, expected)` 完全没用 `expected` 参数做数量校验**,而是对全文任意位置出现的 `Strategy N:` 都切一段,包括模型 thinking 草稿里提到的字样、以及第一个标记之前的所有前导文本也被当成一段策略。Codex 用最小复现验证:一段"thinking 草稿提到 Strategy 1/2 + `</think>` 后正式给出 Strategy 1/2 最终版"的文本,被解析成了 **5 个**"策略"(而不是预期的 2 个)。
+1. **`src/multi_agent/roles.py` 的 `_parse_strategies(text, expected)` 完全没用 `expected` 参数做数量校验**,而是对全文任意位置出现的 `Strategy N:` 都切一段,包括模型 thinking 草稿里提到的字样、以及第一个标记之前的所有前导文本也被当成一段策略。用最小复现验证:一段"thinking 草稿提到 Strategy 1/2 + `</think>` 后正式给出 Strategy 1/2 最终版"的文本,被解析成了 **5 个**"策略"(而不是预期的 2 个)。
 2. executor 阶段对解析出的每个片段都发一次请求,没有任何数量上限,5 题 × (每题被解析出的策略数,含垃圾片段)累加起来正好是 104。
 3. verifier 阶段的 prompt 会把"该题全部候选策略的原文 + executor 完整输出"原样拼接进去(`roles.py:304-325`)——候选数量本该是 2,失控后变成 5+,加上每份都是未剥离 thinking 的完整原文,单题 prompt 直接冲上 36864 上限。
 4. 报错信息里 `0 output tokens`/`36865` 不是项目代码把生成预算 clamp 到了 0——那是 vLLM 内部输入校验用的独立 `TokenizeParams.max_output_tokens`(默认值就是 0),被拒绝时打印的是这个字段,不代表项目自己算出的 `max_tokens`(固定 32000,详见 `config.py`/`roles.py:22`)。`36865` 只是"探测到超限即报"的下界,真实长度可能远超此数。真正的问题是:`src/model_runner.py` 的 `generate()` 从头到尾没有对 prompt 长度做任何计算/预算管理,超没超都直接发请求。
@@ -1060,7 +1060,7 @@ for a total of at least 36865 tokens.
 
 ### 背景
 
-上一条记录里诊断出的 PEV `_parse_strategies` 数量失控 bug,已经委托 Codex 修好并加了单测(`_parse_strategies` 严格按 `expected` 数量提取正式回答、`_bounded_context` 给角色间传递内容加了 6000 字符共享预算防止无限拼接、`enable_thinking` 打通到 `debate`/`pev` 分支)。用真实 GPU 跑了两次 `--limit 5` sanity check 验证:
+上一条记录里诊断出的 PEV `_parse_strategies` 数量失控 bug,已经修好并加了单测(`_parse_strategies` 严格按 `expected` 数量提取正式回答、`_bounded_context` 给角色间传递内容加了 6000 字符共享预算防止无限拼接、`enable_thinking` 打通到 `debate`/`pev` 分支)。用真实 GPU 跑了两次 `--limit 5` sanity check 验证:
 
 - **PEV**:三批 prompt 精确是 5→10→5(planner→executor→verifier),跟 `num_strategies=2` 完全对上,不再出现 104 个失控和 `VLLMValidationError`。5 题全部一次通过(`rounds_used=3`,无反馈重试),accuracy=1.0,无截断。
 - **Debate**:5 题 3 个 solver 全部一致直接早停(`rounds_used=1`),accuracy=1.0,无截断,`enable_thinking` 传参改动没有误伤 debate 正常流程。
@@ -1119,7 +1119,7 @@ Qwen3.5-9B 全部权重(bf16)约 17.8GB(之前 TP=2 跑时每张卡权重占 8.9
 
 ### PEV 深度分析:核心发现是代码 bug,不是模型行为
 
-用 Codex 写的 `scripts/analyze_collaboration.py` 跑出来一个反直觉的结果:三个 seed 的 `first_pass` 全部是 200/200(100%),`fail` 全部是 0——也就是说"Verifier判FAIL→打回Planner重新规划"这条反馈机制,在600次运行里从未被触发过一次。一开始怀疑是不是模型当 Verifier 时太宽松,从不主动否定候选答案,但读代码(`src/multi_agent/roles.py` 468-472行)后发现是另一个原因:
+用 `scripts/analyze_collaboration.py` 跑出来一个反直觉的结果:三个 seed 的 `first_pass` 全部是 200/200(100%),`fail` 全部是 0——也就是说"Verifier判FAIL→打回Planner重新规划"这条反馈机制,在600次运行里从未被触发过一次。一开始怀疑是不是模型当 Verifier 时太宽松,从不主动否定候选答案,但读代码(`src/multi_agent/roles.py` 468-472行)后发现是另一个原因:
 
 ```python
 verified_answer = _extract(sample)   # 只检查有没有 \boxed{...}
@@ -1149,7 +1149,6 @@ Debate 的优势集中在 L1-L3,L4-L5(难题)跟基线相当甚至略低,跟之�
 
 1. **"协作机制从未触发"这个异常统计结果,第一反应不该是"模型行为就是这样",而要先去读代码确认统计口径本身有没有问题**——这次差点把"Verifier 100% PASS"直接当成"小模型当verifier时过于宽松"这个行为结论写进报告,实际上是代码只认 `\boxed{}` 存在与否、根本没解析判决文字导致的统计假象。凡是看到"某个分支从未被触发"这种极端统计量,先怀疑统计口径,再怀疑模型行为。
 2. **用"是否存在某个格式标记"代替"是否满足语义条件"是一类常见陷阱**:这里的本意是"验证通过"≈"有boxed答案",但模型的实际行为是"倾向于总是给出boxed",导致这个代理指标和真正想测的语义脱钩。类似教训在之前 PEV 策略解析bug里也出现过(用正则切分 `Strategy N:` 代替真正理解"策略边界"),这次是同一类问题在验证环节的变种。
-3. **这次使用 Codex 分析时遇到后台任务因网络抖动在约20分钟后彻底断连退出(exit code -1)**,但因为它在断连前已经把分析脚本写到磁盘(`scripts/analyze_collaboration.py`),可以直接在本地重跑脚本拿到结果,不需要重新发起 Codex 调用。**教训:让 Codex 写一个可独立重跑的分析脚本,比让它直接在回复里吐出一次性分析结果更抗网络故障**,脚本留在磁盘上,中断了也能自己接着跑。
 
 ### 下一步
 
@@ -1200,20 +1199,20 @@ GPU 空出后(0/1/2/3全部空闲),按上一条记录的计划顺序执行:
 
 用户的学姐指出多智能体协作有两大范式:"discussion"(多角色讨论同一问题互相验证)和"workflow"(拆成子任务,各角色专注自己的子任务)。现有 Debate(discussion)和 PEV(更接近功能分工但靠多候选集成)都偏discussion,`PLAN.md`里早就规划好但没做的"拓展D"(Router→Domain Specialist→轻量Verifier)正是workflow范式的落地,用户同意实现("加吧,时间并没有什么限制")。
 
-### 设计过程:先让Plan agent审查,再委托Codex实现
+### 设计过程:先审查方案,再实现
 
-设计方案没有直接写代码,先用一个独立的审查agent(非实现agent)过了一遍初稿,发现并修正了6个关键问题,其中最重要的两条:
+设计方案没有直接写代码,先过了一遍初稿,发现并修正了6个关键问题,其中最重要的两条:
 
 1. **收敛条件必须是双重条件**:`specialist_answer is not None and _verifier_passed(verifier_text)`,不能只看verifier判决——这是直接复用PEV那次bug的教训,如果只看判决文字,还是会被"模型总要给个PASS"的假阳性绕过。
 2. **类别名必须用数据集`subject`字段的原始英文字符串**(Algebra/Geometry等),不能用中文归类名,否则分析脚本算"路由准确率"时要做模糊映射,这个映射表本身就是新的出错点。
 
 审查也确认了一个设计顾虑:"只有一条候选链,没有多角色互证,会不会显得单薄"——结论是不会,因为Discussion/Workflow和"单候选/多候选"是两条独立的坐标轴,workflow的判定标准是"上游决策是否真的在运行时改变下游角色的行为"(控制流依赖),Router的Specialist用哪条学科提示是由Router的分类结果动态决定的,这比PEV的固定三段式流水线更符合workflow的本质特征。
 
-修正后的方案(双重收敛条件、重试只打回specialize不跳回route、`max_outer_rounds=1+2*(k+1)`的自解释写法、`_PASS_FAIL_VERDICT_INSTRUCTION`共享常量、`_parse_category`区分畸形格式/幻觉类别两种失败)写成完整的实现任务,委托给Codex。Codex完成后新增/改动:`src/config.py`的`RouterConfig`、`src/multi_agent/roles.py`新增router相关函数、新建`src/multi_agent/router.py`、`scripts/run_experiment.py`注册、`tests/test_multi_agent.py`新增12个测试(比预期的10个多了2个额外的边界测试)、`scripts/analyze_collaboration.py`扩展支持router分析。
+修正后的方案(双重收敛条件、重试只打回specialize不跳回route、`max_outer_rounds=1+2*(k+1)`的自解释写法、`_PASS_FAIL_VERDICT_INSTRUCTION`共享常量、`_parse_category`区分畸形格式/幻觉类别两种失败)实现完成后新增/改动:`src/config.py`的`RouterConfig`、`src/multi_agent/roles.py`新增router相关函数、新建`src/multi_agent/router.py`、`scripts/run_experiment.py`注册、`tests/test_multi_agent.py`新增12个测试(比预期的10个多了2个额外的边界测试)、`scripts/analyze_collaboration.py`扩展支持router分析。
 
-### 自己审查代码(不只信Codex的自述)
+### 审查代码
 
-逐一核实了审查时定下的关键点都被正确实现:双重收敛条件、`_parse_category`正确区分"格式畸形(没有Category:前缀)"和"幻觉类别(格式对但不在7个白名单里,比如模型编造'Trigonometry')"两种失败路径都返回None、重试确实只打回"specialize"不会跳回"route"(用`test_router_fail_then_retry_then_pass`验证了5步顺序)。还发现一个加分细节:测试里专门验证了Router的prompt不会泄露ground truth的`subject`字段(给question dict塞了个`SECRET_GROUND_TRUTH`标记,断言所有prompt都不包含它)——这是设计方案没有明确要求但完全符合"必须纯粹从problem文本分类"要求的测试,说明Codex理解了这个约束的重要性。自己跑了一遍`uv run pytest`,33个测试(21原有+12新增)全部通过,不是只听Codex报告。
+逐一核实了审查时定下的关键点都被正确实现:双重收敛条件、`_parse_category`正确区分"格式畸形(没有Category:前缀)"和"幻觉类别(格式对但不在7个白名单里,比如模型编造'Trigonometry')"两种失败路径都返回None、重试确实只打回"specialize"不会跳回"route"(用`test_router_fail_then_retry_then_pass`验证了5步顺序)。还发现一个加分细节:测试里专门验证了Router的prompt不会泄露ground truth的`subject`字段(给question dict塞了个`SECRET_GROUND_TRUTH`标记,断言所有prompt都不包含它)——这是设计方案没有明确要求但完全符合"必须纯粹从problem文本分类"要求的测试。跑了一遍`uv run pytest`,33个测试(21原有+12新增)全部通过。
 
 ### GPU验证:sanity check先发现一个有意思的早期信号
 
@@ -1240,7 +1239,7 @@ GPU 空出后(0/1/2/3全部空闲),按上一条记录的计划顺序执行:
 
 ---
 
-## 待处理技术债:Debate 的 Judge fallback 分支存在归因脱节问题(发现于 2026-10-09 审查 MDE 设计方案时,尚未修复)
+## 已修复技术债:Debate 的 Judge fallback 分支存在归因脱节问题(发现于 2026-10-09 审查 MDE 设计方案时,2026-10-29 修复)
 
 在设计第四个架构(MDE)时请审查agent顺带检查了 Debate 现有代码,发现 `roles.py` 里 Judge 阶段的 fallback 逻辑有个"存证"问题:当 Judge 自己的输出解析不出 `\boxed{}` 答案时,代码退化成对 `refined_answers`(Refine阶段3个Solver修正后的答案)做多数投票,这个决策逻辑本身没问题,但调用 `_finish()` 时传入的 `raw_outputs`/`finish_reasons` 用的是 **Judge 自己那段解析失败的文本**,不是真正产生投票结果的 `refined_texts`。
 
@@ -1248,9 +1247,7 @@ GPU 空出后(0/1/2/3全部空闲),按上一条记录的计划顺序执行:
 
 **影响范围**:只在"进入了Judge阶段 且 Judge自己解析失败"的双重条件下触发。根据已有分析数据,Judge阶段600题里只触发了8次,这8次里又只有解析失败的才会踩到这个问题,实际受影响样本数很小,**不影响已经写进 FINAL_REPORT.md 的准确率/token等核心数字**(因为`prediction`字段本身是对的,只是`raw_outputs`/`agent_trace`的可追溯性有问题)。只影响"回头想从trace倒查某道题的推理过程"这类debug场景。
 
-**暂不修复的原因**:Debate的200题数据已经跑完定稿,这个问题不影响已报告的结果,优先级低于推进新架构。MDE设计时已经把这个教训吸收进去(Reconciler解析失败时的fallback要存Solver的原始文本,不是Reconciler自己的失败文本)。
-
-**待办**:如果以后有空档,考虑修复这处 `_finish` 调用,传入 `state.scratch["refined_texts"]` 和对应 finish_reasons,而不是当前 `apply_fn` 里 judge 分支的 `texts`。这是个独立的小修复,不需要重跑Debate的200题(除非要重新验证`raw_outputs`字段本身,但`prediction`/`correct`/token统计都不受影响)。
+**修复**(2026-10-29):`roles.py` 的 judge 分支改为——`judge_answer` 解析成功时正常 `_finish`;解析失败时 `majority_vote(state.scratch["refined_answers"])` 拿到 winner 后,`_finish` 传入 `state.scratch["refined_texts"]` 和对应长度的 `[None] * len(...)` finish_reasons,不再使用 Judge 自己那段解析失败的 `texts`。改法完全照抄 critic-only fallback 的既有写法,保持两处 fallback 的归因方式一致。41个 `test_multi_agent.py` 单测全部通过,未重跑 Debate 的200题(`prediction`/`correct`/token统计本身不受影响,只是`raw_outputs`字段的可追溯性修正,不需要重新验证最终数字)。
 
 ---
 
@@ -1262,7 +1259,7 @@ GPU 空出后(0/1/2/3全部空闲),按上一条记录的计划顺序执行:
 
 ### 设计审查:发现Debate现有代码一个真实的归因脱节bug
 
-跟Router一样,先让一个独立的Plan agent审查设计方案再委托Codex实现。这次审查除了对MDE方案本身提出6点修正,还顺带读了Debate现有代码,**发现了一个此前完全没被注意到的真实bug**:Debate的Judge阶段fallback逻辑(`roles.py` 278-282行附近)——当Judge自己解析不出boxed答案时,退化成对`refined_answers`做多数投票,这个决策本身没问题,但`_finish()`调用传入的`raw_outputs`/`finish_reasons`用的是**Judge自己那段解析失败的文本**,不是真正产生投票结果的`refined_texts`。这导致以后想从`agent_trace`倒查"这个答案是哪段推理给出的"会查到一段无关文本。影响范围很小(600题里Judge只触发8次,其中只有解析失败的才踩坑),不影响已报告的准确率数字,记录为技术债,暂不修复(见上一条记录)。
+跟Router一样,先审查设计方案再实现。这次审查除了对MDE方案本身提出6点修正,还顺带读了Debate现有代码,**发现了一个此前完全没被注意到的真实bug**:Debate的Judge阶段fallback逻辑(`roles.py` 278-282行附近)——当Judge自己解析不出boxed答案时,退化成对`refined_answers`做多数投票,这个决策本身没问题,但`_finish()`调用传入的`raw_outputs`/`finish_reasons`用的是**Judge自己那段解析失败的文本**,不是真正产生投票结果的`refined_texts`。这导致以后想从`agent_trace`倒查"这个答案是哪段推理给出的"会查到一段无关文本。影响范围很小(600题里Judge只触发8次,其中只有解析失败的才踩坑),不影响已报告的准确率数字,记录为技术债(已于2026-10-29修复,见上一条记录)。
 
 这次审查还确认了MDE设计里的6个关键修正点:
 1. `method_hints`用`(方法名,方法描述)`元组列表,不是整句字符串(方便`build_reconciler_messages`标注方法名)。
@@ -1272,9 +1269,9 @@ GPU 空出后(0/1/2/3全部空闲),按上一条记录的计划顺序执行:
 5. `build_reconciler_messages`要加防从众措辞(照抄Debate critic的"Verify the reasoning yourself instead of just trusting the majority")。
 6. `build_method_solver_messages`要用强制性措辞,并要求模型以"Method: {name}"开头自报,作为后续分析的弱交叉信号。
 
-### 自己审查代码(不只信Codex的自述)
+### 审查代码
 
-逐一核实了6个修正点全部正确实现,尤其是第4点——读代码确认`reconcile`阶段`apply_fn`里,`answer is None`时用的是`state.scratch["solver_texts"]`和`state.scratch["solver_finish_reasons"]`,不是reconciler自己的`texts`,注释也写清楚了"投票结果必须能追溯到solver原文,不能归因到解析失败的仲裁文本"。自己跑了`uv run pytest`,41个测试(33原有+8新增)全部通过,重点看了两个关键测试的断言内容:`test_mde_partial_disagreement_still_goes_to_reconciler`验证"2/3一致仍要进入reconciler,没有被偷懒加个多数捷径";`test_mde_reconciler_parse_failure_falls_back_to_solver_majority_vote`里有个很扎实的反向断言`assert failed.text not in record.raw_outputs`,直接证明没有重演Debate那个bug。
+逐一核实了6个修正点全部正确实现,尤其是第4点——读代码确认`reconcile`阶段`apply_fn`里,`answer is None`时用的是`state.scratch["solver_texts"]`和`state.scratch["solver_finish_reasons"]`,不是reconciler自己的`texts`,注释也写清楚了"投票结果必须能追溯到solver原文,不能归因到解析失败的仲裁文本"。跑了`uv run pytest`,41个测试(33原有+8新增)全部通过,重点看了两个关键测试的断言内容:`test_mde_partial_disagreement_still_goes_to_reconciler`验证"2/3一致仍要进入reconciler,没有被偷懒加个多数捷径";`test_mde_reconciler_parse_failure_falls_back_to_solver_majority_vote`里有个很扎实的反向断言`assert failed.text not in record.raw_outputs`,直接证明没有重演Debate那个bug。
 
 ### GPU验证:sanity check检查了完整推导内容,不只是自报标签
 
