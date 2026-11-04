@@ -138,7 +138,7 @@ python scripts/run_experiment.py --method self_consistency --repeat 3 --n 5
 
 ---
 
-# 多智能体协作扩展 — 下一阶段设计(主线锁定,避免中途跑偏)
+# 多智能体协作扩展 — 下一阶段设计
 
 ## 任务要求回顾
 
@@ -189,17 +189,7 @@ Router 先判断题目类型(代数/几何/组合/数论/微积分),据此选择
 
 **排除标准的澄清(避免与"Direct/CoT 也是单智能体"混淆)**:排除 Self-Refine 的依据不是"是否只用了一个模型实例",而是"有没有真正的角色分工+信息交叉"。Direct/CoT 本身就是单智能体基线,定位一直是对比基线,不需要也不宣称是协作,不构成排除的理由。Self-Refine 的问题在信息流结构:从头到尾只有一条串行的自我对话链(自己生成→自己看着上一轮输出批评自己→自己改),没有第二份独立产出进来对照,不满足"多份独立候选互相验证"这个协作的核心特征。对比 Debate:3 个 Solver 各自独立解题产出彼此不同的候选,Critic 同时看到多份独立结果找分歧点,Solver 再参考"别人的解法+批评"修正——这里有真正的信息交叉(一个角色的输出影响另一个角色的行为,且输入是多份独立候选)。Self-Refine 哪怕用 prompt 把同一次生成"扮演"成 solver/critic 两个角色,骨子里仍是单线自我修正,故排除。
 
-## 代码架构改动(不碰现有三个基线代码)
-
-新增平行子包,复用现有 `config.py` / `prompts.py` / `model_runner.py` / `results_io.py` 不变:
-
-- `src/multi_agent/roles.py`:各角色 prompt 构造函数(`build_solver_messages`、`build_critic_messages(solver_outputs)`、`build_planner_messages`、`build_executor_messages(plan)`、`build_verifier_messages(question, answer)` 等),部分函数接收上一轮输出作为输入,这就是"信息交互"的代码落地。
-- `src/multi_agent/orchestrator.py`:通用多轮调度器。每轮把当前待处理题目一次性 batch 调 `runner.generate`(保持现有代码"一次性处理全部题目"的效率做法,不逐题调用),按每题结果决定是否进入下一轮(早停判断/反馈判断),未收敛的题目带上下文进入下一轮。Debate 和 PEV 共用这份调度器,区别只在传入的角色 prompt 函数和"是否继续下一轮"的判断逻辑。
-- `src/multi_agent/debate.py`、`src/multi_agent/pev.py`:分别用 orchestrator 拼出两套具体流程。
-- `src/methods/base.py` 里 `QuestionRecord` 新增字段(纯新增,不改现有字段,基线兼容不受影响):`rounds_used: int`、`agent_trace: list[dict]`(角色名、轮次、生成文本、token 数明细)。汇总口径仍能填进现有 `summary.json` 格式(`input_tokens`/`output_tokens`/`total_tokens`)与基线直接对比,同时保留角色级明细供后续分析。
-- `config.py` 新增 `DebateConfig`(如 `num_solvers`、`max_rounds`、`critic_temperature`)、`PEVConfig`(如 `num_strategies`、`max_feedback_rounds`),作为"用了几个 agent、最多几轮、聚合/终止方式"这类考核要求记录项的唯一代码来源。
-
-## 分析计划(呼应考核对"深度分析"的要求)
+## 分析计划
 
 - 按 Level(1-5,数据已有此字段)分层对比协作 vs 基线的准确率/token 增量:预期 Level 1-2 协作收益小甚至负(纯烧 token 或 Critic 误判改错),Level 4-5 协作可能有实质纠错。
 - Debate:统计因初始一致而早停的题目占比、Critic 批评被 Solver 采纳后"改对"与"改错"的比例。
@@ -207,6 +197,3 @@ Router 先判断题目类型(代数/几何/组合/数论/微积分),据此选择
 - 如果做拓展 D:按 subject 分层看协作效果,作为除 Level 之外的第二个分析维度。
 - 所有对比表(基线三个 + 协作两个,拓展视时间加入)统一走同一 `summary.json` 格式,汇总脚本 `scripts/aggregate_results.py` 需要能兼容新方法名。
 
-## 当前状态
-
-Direct/CoT/Self-Consistency 三个基线的 sanity check(每难度抽 1 题,共 5 题)已跑通,`test_methods_base.py` 已覆盖截断兜底逻辑。下一步:200 题正式跑批(3 个基线 × `DEFAULT_SEEDS` 三个 seed),完成后再启动主线 A/B 的代码实现。
