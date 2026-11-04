@@ -28,6 +28,62 @@
 
 四者的范式区分、分析方法与完整结果见 `FINAL_REPORT.md` 第 3、7 节。
 
+## 环境与模型部署
+
+本项目在以下环境验证通过(非唯一可行配置,仅供参考):4 × NVIDIA RTX 4090(24GB),CUDA Driver 535.183.01,Python 3.10。
+
+### 1. 安装依赖
+
+项目用 [uv](https://docs.astral.sh/uv/) 管理依赖(`pyproject.toml` + `uv.lock`),`requires-python == 3.10.*`。
+
+```bash
+uv sync
+```
+
+没有 `uv` 的环境可以退回 `pip`(版本号以 `requirements.txt` 为准,`pyproject.toml`/`uv.lock` 是权威来源):
+
+```bash
+pip install -r requirements.txt
+```
+
+关键依赖版本(来自 `pyproject.toml`):`vllm==0.19.1`、`torch==2.10.0`、`transformers==5.14.1`。**Qwen3.5 架构需要 vLLM ≥ 0.19.x**(早期版本不认识 `Qwen3_5ForConditionalGeneration`),`transformers` 也必须是 5.x(vLLM 0.19.1 声明依赖 `transformers<5` 会触发 pip 警告,但实测强制装 5.14.1 可用,更早的 4.x 不认识 `qwen3_5` 模型类型)。
+
+### 2. 下载模型
+
+模型默认走 HuggingFace 缓存机制,下载到本地后把路径填进 `src/config.py` 的 `ModelConfig.model_path`。
+
+```bash
+pip install -U huggingface_hub
+# 国内网络可设镜像加速,没有这个限制可以不设:
+export HF_ENDPOINT=https://hf-mirror.com
+export HF_HOME=/path/to/your/cache/huggingface   # 可选,默认是 ~/.cache/huggingface
+
+huggingface-cli download Qwen/Qwen3.5-9B --local-dir /path/to/your/models/Qwen3.5-9B
+```
+
+9B 模型(bf16)约 19GB,4 个 safetensors 分片。下载完成后修改 `src/config.py`:
+
+```python
+model_path: str = "/path/to/your/models/Qwen3.5-9B"
+```
+
+### 3. GPU 显存与并行配置
+
+`src/config.py` 的 `ModelConfig` 里几个关键参数需要按实际硬件调整:
+
+| 参数 | 本项目实测值 | 说明 |
+|---|---|---|
+| `tensor_parallel_size` | 2 | 9B 模型切成 2 张卡;单卡显存够大(如 A100 80GB)可以设为 1 |
+| `gpu_memory_utilization` | 0.85 | vLLM 显存预算上限,按实际空闲显存调整 |
+| `max_model_len` | 36864 | 上下文窗口上限(模型本身支持到 262144,这里按显存预算保守设) |
+| `max_num_seqs` | 32 | 最大并发序列数,默认 256 对本项目的题量(单次最多 200 题)偏大,调低可避免启动阶段 OOM |
+
+跑之前用 `CUDA_VISIBLE_DEVICES` 指定空闲的 GPU(例如 `CUDA_VISIBLE_DEVICES=0,1`),显存不够或被其他进程占用时 vLLM 会在启动阶段直接报错,不会静默失败。
+
+### 4. 环境搭建中遇到的问题(可选参考)
+
+如果换了硬件/驱动版本遇到安装报错(如 `libstdc++` ABI 不兼容、transformers 版本冲突、GPU 被占用等),可以参考 `LEARNING_NOTES.md` 里 2026-08-16 前后的记录,里面有本项目搭建环境时踩过的坑和对应解法。
+
 ## 目录结构
 
 ```

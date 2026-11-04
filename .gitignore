@@ -24,3 +24,6 @@ EXPERIMENT_COMMANDS.md
 PROJECT_STATUS.md
 road.txt
 note2.md
+
+# 未完成的探索性消融脚本(GPU被占用导致未能跑通,搁置)
+scripts/critic_context_ablation.py
